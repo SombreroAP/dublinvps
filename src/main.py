@@ -23,18 +23,27 @@ async def main() -> None:
 
     # Cache opening prices: snapped from Binance the moment we first see the market.
     openings: dict[str, float] = {}
+    # Cache markets list — refresh from Gamma every 10s, not every loop tick.
+    cache: dict = {"markets": [], "fetched_at": 0.0}
+    GAMMA_TTL = 10.0
 
     async with httpx.AsyncClient() as http:
         async def provider() -> tuple[list[Market], dict[str, float]]:
-            markets = await fetch_active_markets(http, horizon_sec=900)
-            for m in markets:
+            now = asyncio.get_event_loop().time()
+            if now - cache["fetched_at"] > GAMMA_TTL:
+                try:
+                    cache["markets"] = await fetch_active_markets(http, horizon_sec=900)
+                    cache["fetched_at"] = now
+                    log.info("gamma.refresh", count=len(cache["markets"]))
+                except Exception as e:
+                    log.error("gamma.error", error=str(e))
+            for m in cache["markets"]:
                 if m.slug not in openings and feed.last_price.get(m.asset) is not None:
-                    # NOTE: this is a placeholder. True opening price = Chainlink
-                    # Data Stream snapshot at round start. For paper mode we
-                    # approximate from Binance at first sight; replace with a
-                    # Chainlink subscription before live trading.
+                    # NOTE: placeholder. True opening = Chainlink Data Stream
+                    # snapshot at round start. Paper mode approximates from
+                    # Binance at first sight; swap to Chainlink before live.
                     openings[m.slug] = feed.last_price[m.asset]
-            return markets, openings
+            return cache["markets"], openings
 
         await asyncio.gather(feed_task, run_loop(feed, clob, provider))
 
