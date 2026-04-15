@@ -108,13 +108,18 @@ def _fetch_live_ask(slug: str, side: str) -> float | None:
 
 
 def _fetch_resolution(slug: str) -> str:
-    """Cached Gamma resolution lookup. ttl=60s.
+    """Cached Gamma resolution lookup.
+    UP/DOWN once resolved — cached FOREVER (they don't change).
+    open/notfound — cached 30s (might flip soon).
     Returns UP/DOWN if resolved (or implicitly decided post-end with
     outcomePrices >= 0.95), else open/notfound/err."""
     now = time.time()
     hit = _resolution_cache.get(slug)
-    if hit and now - hit[0] < 60:
-        return hit[1]
+    if hit:
+        age = now - hit[0]
+        # Terminal states stay cached forever. Non-terminal refetch after 30s.
+        if hit[1] in ("UP", "DOWN") or age < 30:
+            return hit[1]
     try:
         raw = subprocess.check_output([
             "curl", "-s", "-H", "User-Agent: Mozilla/5.0",
@@ -730,9 +735,25 @@ def _bot_status() -> dict:
     return {"sniper_service": out}
 
 
+# Stale-cache fallbacks. If any one computation throws (usually a subprocess
+# curl timing out / Cloudflare 429'ing), return the last successful value
+# rather than propagating a 500 to the frontend — that used to produce
+# "blank dashboard every few polls". Only replaced when a new success lands.
+_last_good: dict = {}
+
+
+def _safe_call(key: str, fn):
+    try:
+        v = fn()
+        _last_good[key] = v
+        return v
+    except Exception as e:
+        log.error("safe_call.fallback", key=key, error=str(e))
+        return _last_good.get(key, {})
+
+
 @app.get("/api/summary")
 def api_summary(_=Depends(_check_auth)) -> JSONResponse:
-    bt = _compute_backtest()
     return JSONResponse({
         "now": int(time.time()),
         "dashboard_uptime_sec": int(time.time() - _started),
@@ -742,10 +763,10 @@ def api_summary(_=Depends(_check_auth)) -> JSONResponse:
             "prices": _chainlink.last_price,
             "last_update_ms": _chainlink.last_ts_ms,
         },
-        "backtest": bt,
-        "live": _compute_live_state(),
-        "shadow": _compute_shadow_backtest(),
-        "arb": _compute_arb_backtest(),
+        "backtest": _safe_call("backtest", _compute_backtest),
+        "live":     _safe_call("live",     _compute_live_state),
+        "shadow":   _safe_call("shadow",   _compute_shadow_backtest),
+        "arb":      _safe_call("arb",      _compute_arb_backtest),
     })
 
 
