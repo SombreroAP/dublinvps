@@ -40,6 +40,11 @@ class Settings(BaseSettings):
     # wins ~87%. Below this threshold our Brownian model is too noisy to trust.
     min_fair_p: float = 0.85
 
+    # Sides enabled. Data as of first 34 realistic picks: YES won 75% / +$90,
+    # NO won 57% / -$95. Turning NO off removed the losing leg entirely.
+    # Change to "YES,NO" once/if NO performance improves.
+    enabled_sides: str = "YES"
+
     # Mode
     mode: str = Field(default="paper", pattern="^(paper|live)$")
 

@@ -71,13 +71,14 @@ async def evaluate_and_log(
     p_yes = fair_yes_probability(market.asset, current_price, opening_price, sec_left)
 
     # Use the cached ask to decide if signal-worthy; refetch live for logging.
+    allowed = {s.strip() for s in settings.enabled_sides.split(",")}
     side = None
-    if p_yes > 0.5 and market.best_ask_yes is not None:
+    if p_yes > 0.5 and market.best_ask_yes is not None and "YES" in allowed:
         side = "YES"
         cached_ask = market.best_ask_yes
         target_p = p_yes
         token_id = market.yes_token_id
-    elif p_yes < 0.5 and market.best_ask_no is not None:
+    elif p_yes < 0.5 and market.best_ask_no is not None and "NO" in allowed:
         side = "NO"
         cached_ask = market.best_ask_no
         target_p = 1 - p_yes
