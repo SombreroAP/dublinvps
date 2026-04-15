@@ -191,26 +191,50 @@ def _compute_backtest() -> dict:
             pending += 1
         tot_pl += pl
         target = "UP" if side == "YES" else "DOWN"
-        live = _chainlink.last_price.get(r["asset"])
         open_px = r.get("opening")
-        delta = (live - open_px) if (live is not None and open_px is not None) else None
-        # Live ask only makes sense for open markets (and we don't want to hammer
-        # CLOB for resolved ones).
-        live_ask = _fetch_live_ask(slug, side) if status_ == "open" else None
-        # "open" splits into (a) round still running vs (b) ended, awaiting
-        # resolution. Slug timestamp = round-start; round-end = +300.
+        # Phase: active (round running) / pending (round over, awaiting
+        # Polymarket resolution) / WIN / LOSS / etc. Determines whether we
+        # show a moving "live px" or freeze at the round-close snapshot.
         phase = status_
+        round_end_ts = None
         if status_ == "open":
             try:
-                round_start = int(slug.split("-")[-1])
-                phase = "active" if (round_start + 300) > time.time() else "pending"
+                round_end_ts = int(slug.split("-")[-1]) + 300
+                phase = "active" if round_end_ts > time.time() else "pending"
             except (ValueError, IndexError):
                 phase = "active"
-        # Is live trending toward winning? (only meaningful while open)
+        # For ACTIVE picks, "live" is the current moving Chainlink price.
+        # For PENDING / resolved picks, freeze at the Chainlink close snapshot.
+        if phase == "active":
+            live = _chainlink.last_price.get(r["asset"])
+        else:
+            live = None
+            if round_end_ts is not None:
+                live = _chainlink.opening_at(r["asset"], round_end_ts)
+            if live is None:
+                # Fallback when round_end is outside our rolling Chainlink
+                # history (dashboard restarted after the round ended).
+                live = _chainlink.last_price.get(r["asset"])
+        delta = (live - open_px) if (live is not None and open_px is not None) else None
+        live_ask = _fetch_live_ask(slug, side) if phase == "active" else None
         if delta is None:
             trending = None
         else:
             trending = (target == "UP" and delta > 0) or (target == "DOWN" and delta < 0)
+
+        # Expected result / P&L projection for PENDING picks using the
+        # frozen Chainlink close. Polymarket resolves UP on close ≥ open.
+        expected_result = None
+        expected_pl = None
+        if phase == "pending" and live is not None and open_px is not None:
+            close_up = live >= open_px
+            expected_won = (target == "UP" and close_up) or \
+                           (target == "DOWN" and not close_up)
+            expected_result = "WIN" if expected_won else "LOSS"
+            shares = r["size_usdc"] / r["ask"] if r["ask"] > 0 else 0
+            expected_pl = (shares * (1.0 if expected_won else 0.0)
+                           - r["size_usdc"] - r["size_usdc"] * r["fee"])
+
         picks.append({
             "ts": r["ts"], "slug": slug, "asset": r["asset"], "side": side,
             "target": target,
@@ -218,6 +242,7 @@ def _compute_backtest() -> dict:
             "fee": r["fee"], "size_usdc": r["size_usdc"],
             "opening": open_px, "live": live, "delta": delta,
             "live_ask": live_ask, "trending": trending, "phase": phase,
+            "expected_result": expected_result, "expected_pl": expected_pl,
             "result": status_, "pl": pl,
         })
 
@@ -655,7 +680,7 @@ tr:hover td { background:#192029; }
 <div class="card" style="margin:0 16px 16px; border-color:#4a3d1a">
   <h2 style="color:#d29922">⏳ Waiting to resolve <span id="pending_count" class="mut" style="font-weight:400"></span></h2>
   <table id="pending_tbl"><thead>
-    <tr><th>Time</th><th>Asset</th><th>Target</th><th>Ask</th><th>Fair p</th><th>Edge</th><th>Size</th><th>Open px</th><th>Close px</th><th>Slug</th></tr>
+    <tr><th>Time</th><th>Asset</th><th>Target</th><th>Ask</th><th>Fair p</th><th>Edge</th><th>Size</th><th>Open px</th><th>Close px</th><th>Expected</th><th>Est P&amp;L</th><th>Slug</th></tr>
   </thead><tbody></tbody></table>
   <div id="pending_empty" class="mut" style="padding:12px 4px; display:none">No picks awaiting resolution.</div>
 </div>
@@ -815,6 +840,18 @@ async function refresh() {
       const t = new Date(p.ts*1000).toLocaleTimeString();
       const tgtCls = p.target==="UP" ? "ok" : "bad";
       const tgtArrow = p.target==="UP" ? "↑" : "↓";
+      // Expected result + P&L based on Chainlink close vs open (our best
+      // projection until Polymarket officially writes the outcome).
+      let expCell = "—", expCls = "mut";
+      if (p.expected_result) {
+        expCell = `<span class="pill ${p.expected_result}">${p.expected_result}</span>`;
+      }
+      let epl = "—", eplCls = "mut";
+      if (p.expected_pl != null) {
+        const s = p.expected_pl >= 0 ? "+" : "";
+        epl = `${s}$${p.expected_pl.toFixed(2)}`;
+        eplCls = p.expected_pl > 0 ? "ok" : p.expected_pl < 0 ? "bad" : "mut";
+      }
       const tr = document.createElement("tr");
       tr.innerHTML = `<td class="mut">${t}</td><td>${p.asset}</td>
         <td class="${tgtCls}">${tgtArrow} ${p.target}</td>
@@ -824,6 +861,8 @@ async function refresh() {
         <td>$${p.size_usdc.toFixed(0)}</td>
         <td>${fmtPx(p.opening, p.asset)}</td>
         <td>${fmtPx(p.live, p.asset)}</td>
+        <td>${expCell}</td>
+        <td class="${eplCls}">${epl}</td>
         <td class="mut">${p.slug}</td>`;
       pendingBody.appendChild(tr);
     }
