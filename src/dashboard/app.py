@@ -101,7 +101,7 @@ def _fetch_resolution(slug: str) -> str:
 
 def _compute_backtest() -> dict:
     global _backtest_cache
-    if _backtest_cache and time.time() - _backtest_cache[0] < 30:
+    if _backtest_cache and time.time() - _backtest_cache[0] < 5:
         return _backtest_cache[1]
 
     rows = _read_signals()
@@ -251,7 +251,7 @@ tr:hover td { background:#192029; }
 </div>
 
 <div class="foot">
-  <div>auto-refresh every 10s · dashboard uptime <span id="uptime">—</span></div>
+  <div>auto-refresh every 2s · dashboard uptime <span id="uptime">—</span></div>
   <div>bot: <span id="bot_status" class="mut">—</span></div>
 </div>
 
@@ -327,7 +327,7 @@ async function refresh() {
     document.getElementById("status").textContent = "ERR";
   }
 }
-refresh(); setInterval(refresh, 10000);
+refresh(); setInterval(refresh, 2000);
 </script>
 </body></html>
 """
