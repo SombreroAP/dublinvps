@@ -106,7 +106,9 @@ def _fetch_live_ask(slug: str, side: str) -> float | None:
 
 
 def _fetch_resolution(slug: str) -> str:
-    """Cached Gamma resolution lookup. ttl=60s."""
+    """Cached Gamma resolution lookup. ttl=60s.
+    Returns UP/DOWN if resolved (or implicitly decided post-end with
+    outcomePrices >= 0.95), else open/notfound/err."""
     now = time.time()
     hit = _resolution_cache.get(slug)
     if hit and now - hit[0] < 60:
@@ -121,18 +123,37 @@ def _fetch_resolution(slug: str) -> str:
             result = "notfound"
         else:
             m = d[0].get("markets", [{}])[0]
-            if not m.get("closed"):
-                result = "open"
-            else:
-                op = json.loads(m.get("outcomePrices") or "[]")
-                if op == ["1", "0"]:
+            op_raw = m.get("outcomePrices") or "[]"
+            try:
+                op = [float(x) for x in json.loads(op_raw)]
+            except (ValueError, TypeError):
+                op = []
+            # Hard-resolved: outcomePrices == ["1","0"] / ["0","1"] AND closed.
+            # Soft-resolved: market past endDate AND outcomePrices >= 0.95
+            #   (Polymarket has ~30-60s lag between round end and writing the
+            #    official close, but the orderbook converges immediately.)
+            from datetime import datetime, timezone
+            past_end = False
+            if m.get("endDate"):
+                try:
+                    end_ts = datetime.fromisoformat(
+                        m["endDate"].replace("Z", "+00:00")).timestamp()
+                    past_end = time.time() > end_ts
+                except (ValueError, TypeError):
+                    pass
+            if len(op) == 2 and (m.get("closed") or past_end):
+                if op[0] >= 0.95:
                     result = "UP"
-                elif op == ["0", "1"]:
+                elif op[1] >= 0.95:
                     result = "DOWN"
+                elif m.get("closed"):
+                    result = "unknown"  # closed but ambiguous prices
                 else:
-                    result = "unknown"
-    except Exception as e:
-        result = f"err"
+                    result = "open"  # past end but not yet decided
+            else:
+                result = "open"
+    except Exception:
+        result = "err"
     _resolution_cache[slug] = (now, result)
     return result
 

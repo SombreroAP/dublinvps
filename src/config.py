@@ -30,6 +30,12 @@ class Settings(BaseSettings):
     sigma_bps_eth: float = 1.2
     sigma_bps_sol: float = 1.5
 
+    # Sanity filter: if our model disagrees with the market by more than this
+    # (in probability points), SKIP the signal. Large disagreements usually
+    # mean the market knows something (e.g. Chainlink/Binance divergence,
+    # news), not that we found an impossibly-good edge.
+    max_disagreement: float = 0.30
+
     # Mode
     mode: str = Field(default="paper", pattern="^(paper|live)$")
 

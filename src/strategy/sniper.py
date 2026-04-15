@@ -16,7 +16,7 @@ import orjson
 
 from src.config import settings
 from src.logging_setup import log
-from src.polymarket.gamma import Market, fetch_clob_fill_ask
+from src.polymarket.gamma import Market, fetch_clob_book, sweep_fill_ask
 
 PAPER_LOG = Path("paper_trades.jsonl")
 
