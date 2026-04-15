@@ -27,10 +27,10 @@ from src.polymarket.gamma import Market, fetch_active_markets, fetch_clob_fill_a
 PAPER_LOG = Path("paper_trades_arb.jsonl")
 
 # Tunables
-ARB_MIN_PROFIT = 0.010        # fire when guaranteed profit > 1%
+ARB_MIN_PROFIT = -0.05        # diagnostic: log near-misses too (up to 5% loss after fees)
 POSITION_USDC = 10.0          # desired fill size per side
 GAMMA_TTL = 3.0
-POLL_SEC = 1.0
+POLL_SEC = 0.25               # aggressive polling — catch momentary gaps
 
 
 def estimate_net_profit(yes_ask: float, no_ask: float,
