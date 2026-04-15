@@ -61,9 +61,14 @@ def _scrape(activity_type: str | None, dest: Path, label: str) -> int:
             break
         if not page:
             break
+        if not isinstance(page, list):
+            print(f"[{label}] non-list response at offset={offset}, stopping (likely API cap). raw={str(page)[:120]}")
+            break
         added_in_page = 0
         with dest.open("ab") as f:
             for r in page:
+                if not isinstance(r, dict):
+                    continue
                 key = r.get("transactionHash", "") + "|" + str(r.get("logIndex", ""))
                 if key in seen:
                     continue
