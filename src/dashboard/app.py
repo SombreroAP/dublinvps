@@ -26,6 +26,7 @@ from src.feeds.chainlink import ChainlinkFeed
 from src.polymarket.gamma import fetch_active_markets
 
 PAPER_LOG = Path("/opt/sniper/paper_trades.jsonl")
+LADDER_LOG = Path("/opt/sniper/paper_trades_ladder.jsonl")
 CHAINLINK_CUTOFF = 1776250620  # systemd go-live; edit as needed
 
 DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD") or ""
@@ -213,6 +214,73 @@ def _compute_backtest() -> dict:
 
 
 _live_state_cache: tuple[float, list] | None = None
+_ladder_cache: tuple[float, dict] | None = None
+
+
+def _compute_ladder_backtest() -> dict:
+    """Read paper_trades_ladder.jsonl, fetch resolutions, simulate fills."""
+    global _ladder_cache
+    if _ladder_cache and time.time() - _ladder_cache[0] < 5:
+        return _ladder_cache[1]
+
+    rows: list[dict] = []
+    if LADDER_LOG.exists():
+        with LADDER_LOG.open() as f:
+            for line in f:
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+
+    # One ladder per (slug, side) — most recent kept
+    by_key: dict[tuple[str, str], dict] = {}
+    for r in rows:
+        by_key[(r["slug"], r["side"])] = r
+
+    picks = []
+    tot_pl = 0.0
+    wins = losses = pending = 0
+    total_staked = 0.0
+    for (slug, side), r in sorted(by_key.items(), key=lambda kv: kv[1]["ts"], reverse=True):
+        result = _fetch_resolution(slug)
+        # Simulated fills: assume all ladder rungs filled (paper-mode optimism;
+        # real fills depend on whether the market traded through each price).
+        staked = r.get("total_usdc", 0.0)
+        total_staked += staked
+        if result in ("UP", "DOWN"):
+            won = (side == "YES" and result == "UP") or (side == "NO" and result == "DOWN")
+            payoff = 0.0
+            for price, usdc in r["levels"]:
+                shares = usdc / price
+                payoff += shares * (1.0 if won else 0.0)
+            # Maker rebate ≈ 0 fee for simplicity (real makers pay 0 + rebate)
+            pl = payoff - staked
+            status = "WIN" if won else "LOSS"
+            if won: wins += 1
+            else: losses += 1
+        else:
+            pl = 0.0
+            status = result
+            pending += 1
+        tot_pl += pl
+        picks.append({
+            "ts": r["ts"], "slug": slug, "asset": r["asset"], "side": side,
+            "z_score": r.get("z_score"), "move_bps": r.get("move_bps"),
+            "sec_left": r.get("sec_left"), "opening": r.get("opening"),
+            "current_at_signal": r.get("current"), "total_usdc": staked,
+            "result": status, "pl": pl,
+        })
+
+    out = {
+        "total_signals": len(rows),
+        "unique_picks": len(by_key),
+        "wins": wins, "losses": losses, "pending": pending,
+        "win_rate": (wins / (wins + losses)) if (wins + losses) else None,
+        "total_pl": tot_pl, "total_staked": total_staked,
+        "picks": picks[:50],
+    }
+    _ladder_cache = (time.time(), out)
+    return out
 
 
 def _fair_yes_p(asset: str, current: float, opening: float,
@@ -374,6 +442,7 @@ def api_summary(_=Depends(_check_auth)) -> JSONResponse:
         },
         "backtest": bt,
         "live": _compute_live_state(),
+        "ladder": _compute_ladder_backtest(),
     })
 
 
@@ -452,8 +521,18 @@ tr:hover td { background:#192029; }
   <div id="pending_empty" class="mut" style="padding:12px 4px; display:none">No picks awaiting resolution.</div>
 </div>
 
+<div class="card" style="margin:0 16px 16px; border-color:#3a2d4a">
+  <h2 style="color:#a371f7">🪜 Ladder bot (fade strategy)
+    <span id="ladder_summary" class="mut" style="font-weight:400; margin-left:8px"></span>
+  </h2>
+  <table id="ladder_tbl"><thead>
+    <tr><th>Time</th><th>Asset</th><th>Side</th><th>z</th><th>Move</th><th>Sec left</th><th>Open</th><th>Current</th><th>Stake</th><th>Result</th><th>P&amp;L</th><th>Slug</th></tr>
+  </thead><tbody></tbody></table>
+  <div id="ladder_empty" class="mut" style="padding:12px 4px; display:none">No ladder signals yet. Fires when |z| ≥ 2 at T-90s to T-45s.</div>
+</div>
+
 <div class="card" style="margin:0 16px 16px">
-  <h2>Recent resolved picks</h2>
+  <h2>Recent resolved picks (sniper)</h2>
   <table id="picks_tbl"><thead>
     <tr><th>Time</th><th>Asset</th><th>Target</th><th>Ask</th><th>Fair p</th><th>Edge</th><th>Size</th><th>Open px</th><th>Result</th><th>P&amp;L</th><th>Slug</th></tr>
   </thead><tbody></tbody></table>
@@ -603,6 +682,42 @@ async function refresh() {
         <td>${fmtPx(p.live, p.asset)}</td>
         <td class="mut">${p.slug}</td>`;
       pendingBody.appendChild(tr);
+    }
+
+    // Ladder bot rendering
+    const ladder = d.ladder || {};
+    const ladderBody = document.querySelector("#ladder_tbl tbody");
+    if (ladderBody) {
+      ladderBody.innerHTML = "";
+      const lpicks = ladder.picks || [];
+      const wr = ladder.win_rate==null ? "—" : (ladder.win_rate*100).toFixed(1)+"%";
+      const plS = (ladder.total_pl>=0?"+":"") + "$" + (ladder.total_pl||0).toFixed(2);
+      const plCls = ladder.total_pl>0?"ok":ladder.total_pl<0?"bad":"mut";
+      document.getElementById("ladder_summary").innerHTML =
+        `<span class="${plCls}">${plS}</span> · ${wr} win rate · ${ladder.wins||0}W/${ladder.losses||0}L/${ladder.pending||0}P · staked $${(ladder.total_staked||0).toFixed(2)}`;
+      document.getElementById("ladder_empty").style.display = lpicks.length ? "none" : "block";
+      for (const p of lpicks) {
+        const t = new Date(p.ts*1000).toLocaleTimeString();
+        const sideCls = p.side==="YES" ? "ok" : "bad";
+        const sideArrow = p.side==="YES" ? "↑ UP" : "↓ DOWN";
+        const plS2 = (p.pl>=0?"+":"") + "$" + p.pl.toFixed(2);
+        const plCls2 = p.pl>0?"ok":p.pl<0?"bad":"mut";
+        const moveCls = p.move_bps==null ? "mut" : (p.move_bps>0 ? "ok" : "bad");
+        const moveStr = p.move_bps==null ? "—" : `${p.move_bps>=0?"+":""}${p.move_bps.toFixed(1)} bps`;
+        const tr = document.createElement("tr");
+        tr.innerHTML = `<td class="mut">${t}</td><td>${p.asset}</td>
+          <td class="${sideCls}">${sideArrow}</td>
+          <td>${p.z_score==null?"—":p.z_score.toFixed(2)}</td>
+          <td class="${moveCls}">${moveStr}</td>
+          <td>${p.sec_left==null?"—":Math.round(p.sec_left)+"s"}</td>
+          <td>${fmtPx(p.opening, p.asset)}</td>
+          <td>${fmtPx(p.current_at_signal, p.asset)}</td>
+          <td>$${(p.total_usdc||0).toFixed(2)}</td>
+          <td><span class="pill ${p.result}">${p.result}</span></td>
+          <td class="${plCls2}">${plS2}</td>
+          <td class="mut">${p.slug}</td>`;
+        ladderBody.appendChild(tr);
+      }
     }
 
     for (const p of resolvedPicks) {

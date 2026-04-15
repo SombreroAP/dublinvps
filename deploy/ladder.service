@@ -1,0 +1,26 @@
+[Unit]
+Description=Polymarket Ladder-Fade Bot (paper)
+After=network-online.target chrony.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sniper
+Group=sniper
+WorkingDirectory=/opt/sniper
+EnvironmentFile=/opt/sniper/.env
+ExecStart=/opt/sniper/.venv/bin/python -m src.ladder.main
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ladder
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/sniper/logs /opt/sniper/paper_trades_ladder.jsonl
+
+[Install]
+WantedBy=multi-user.target
