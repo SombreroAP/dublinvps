@@ -124,26 +124,75 @@ def _parse_event(evt: dict) -> Market | None:
 CLOB_BOOK_URL = "https://clob.polymarket.com/book"
 
 
-async def fetch_clob_top(client: httpx.AsyncClient, token_id: str
-                          ) -> tuple[float | None, float | None]:
-    """Return (best_bid, best_ask) from CLOB orderbook. None if empty/error.
-    Public: used both at market-discovery refresh AND on-demand inside the
-    sniper's decision loop to get a sub-second-fresh ask before firing.
-    """
+async def fetch_clob_book(client: httpx.AsyncClient, token_id: str
+                           ) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
+    """Return (bids, asks) sorted best-first, as list of (price, size)."""
     try:
         r = await client.get(CLOB_BOOK_URL, params={"token_id": token_id}, timeout=2.0)
         r.raise_for_status()
         b = r.json()
-        bids = b.get("bids") or []
-        asks = b.get("asks") or []
-        best_bid = max((float(x["price"]) for x in bids), default=None)
-        best_ask = min((float(x["price"]) for x in asks), default=None)
-        return best_bid, best_ask
+        bids = sorted(((float(x["price"]), float(x["size"])) for x in (b.get("bids") or [])),
+                      key=lambda x: -x[0])
+        asks = sorted(((float(x["price"]), float(x["size"])) for x in (b.get("asks") or [])),
+                      key=lambda x: x[0])
+        return bids, asks
     except (httpx.HTTPError, ValueError, KeyError):
-        return None, None
+        return [], []
 
 
-# Backward-compat alias for internal callers
+async def fetch_clob_top(client: httpx.AsyncClient, token_id: str
+                          ) -> tuple[float | None, float | None]:
+    """Best-bid / best-ask convenience. DOES NOT consider depth — use
+    `fetch_clob_fill_ask` when you actually want a fillable price."""
+    bids, asks = await fetch_clob_book(client, token_id)
+    return (bids[0][0] if bids else None, asks[0][0] if asks else None)
+
+
+def sweep_fill_ask(asks: list[tuple[float, float]], usdc_budget: float
+                   ) -> tuple[float | None, float]:
+    """Walk up the ask book, buying shares until we've spent usdc_budget.
+    Returns (effective_avg_ask, usdc_actually_fillable).
+
+    - effective_avg_ask is the volume-weighted average ask price we'd pay;
+      None if book is empty.
+    - usdc_actually_fillable is how much of our budget the book can absorb.
+      If the book is thin, this may be less than usdc_budget.
+    """
+    if not asks:
+        return None, 0.0
+    spent = 0.0
+    shares_bought = 0.0
+    for price, size in asks:
+        # At this price each share costs `price` USDC; size is share count.
+        # Buying all `size` shares costs price*size USDC.
+        level_cost = price * size
+        remaining = usdc_budget - spent
+        if level_cost <= remaining:
+            spent += level_cost
+            shares_bought += size
+            continue
+        # Partial fill: buy as many shares as `remaining` USDC allows at `price`
+        partial_shares = remaining / price if price > 0 else 0
+        spent += remaining
+        shares_bought += partial_shares
+        break
+    if shares_bought <= 0:
+        return None, 0.0
+    return spent / shares_bought, spent
+
+
+async def fetch_clob_fill_ask(client: httpx.AsyncClient, token_id: str,
+                               usdc_budget: float
+                               ) -> tuple[float | None, float | None, float]:
+    """Fetch book and compute fillable ask for our size.
+    Returns (effective_avg_ask, best_ask, usdc_fillable)."""
+    bids, asks = await fetch_clob_book(client, token_id)
+    best = asks[0][0] if asks else None
+    eff, filled = sweep_fill_ask(asks, usdc_budget)
+    return eff, best, filled
+
+
+# Backward-compat alias
 _fetch_clob_top = fetch_clob_top
 
 

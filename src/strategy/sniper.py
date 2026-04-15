@@ -16,7 +16,7 @@ import orjson
 
 from src.config import settings
 from src.logging_setup import log
-from src.polymarket.gamma import Market, fetch_clob_top
+from src.polymarket.gamma import Market, fetch_clob_fill_ask
 
 PAPER_LOG = Path("paper_trades.jsonl")
 
@@ -92,32 +92,43 @@ async def evaluate_and_log(
     if cached_edge < settings.edge_threshold - 0.03:
         return
 
-    # Live refetch for authoritative ask
+    # Live refetch with DEPTH — compute the VWAP ask we'd actually pay for
+    # our position size, not the dust-order best ask. This kills the
+    # "$25 at 0.001 ask" fantasy fills.
     refetch_start = time.monotonic()
-    live_bid, live_ask = await fetch_clob_top(http, token_id)
+    desired_size = settings.max_position_usdc
+    fill_ask, best_ask, fillable = await fetch_clob_fill_ask(
+        http, token_id, desired_size,
+    )
     price_age_ms = int((time.monotonic() - refetch_start) * 1000)
-    if live_ask is None:
+    if fill_ask is None:
+        return
+    # If the book can't absorb at least $5 of our order, skip — dust.
+    if fillable < 5.0:
         return
 
-    fee = market.taker_fee_at(live_ask)
-    edge = target_p - live_ask - fee
+    fee = market.taker_fee_at(fill_ask)
+    edge = target_p - fill_ask - fee
     if edge <= settings.edge_threshold:
         return
 
     key = (market.slug, side)
-    fingerprint = (round(live_ask, 4), round(target_p, 3))
+    fingerprint = (round(fill_ask, 4), round(target_p, 3))
     if last_sig.get(key) == fingerprint:
         return
     last_sig[key] = fingerprint
 
     sig = {
         "ts": time.time(), "slug": market.slug, "asset": market.asset,
-        "side": side, "ask": live_ask, "bid": live_bid,
+        "side": side,
+        "ask": fill_ask,                       # VWAP we'd actually pay
+        "best_ask": best_ask,                  # top-of-book reference
         "cached_ask_at_discovery": cached_ask,
-        "price_age_ms": price_age_ms,  # how long the live refetch took
+        "fillable_usdc": fillable,
+        "price_age_ms": price_age_ms,
         "fair_p": target_p, "edge": edge, "fee": fee,
         "current": current_price, "opening": opening_price, "sec_left": sec_left,
-        "size_usdc": min(settings.max_position_usdc,
+        "size_usdc": min(fillable, settings.max_position_usdc,
                          settings.max_position_usdc * edge / 0.05),
     }
     PAPER_LOG.open("ab").write(orjson.dumps(sig) + b"\n")
