@@ -45,21 +45,28 @@ def evaluate(
     current_price: float,
     opening_price: float,
 ) -> dict | None:
+    """Edge units: fraction of $1-per-share notional.
+    EV per share at price p, on a contract that pays $1 with probability fair_p:
+        EV = fair_p - p - fee(p)
+    where fee(p) is in fraction-of-notional. Threshold is in same units.
+    """
     sec_left = market.seconds_remaining
     if not (settings.entry_window_end_sec < sec_left <= settings.entry_window_start_sec):
         return None
     p_yes = fair_yes_probability(current_price, opening_price, sec_left)
 
     if p_yes > 0.5 and market.best_ask_yes is not None:
-        edge = p_yes - market.best_ask_yes - market.fee_rate
+        ask = market.best_ask_yes
+        edge = p_yes - ask - market.taker_fee_at(ask)
         if edge > settings.edge_threshold:
-            return _signal(market, "YES", market.best_ask_yes, p_yes, edge,
+            return _signal(market, "YES", ask, p_yes, edge,
                            current_price, opening_price, sec_left)
     if p_yes < 0.5 and market.best_ask_no is not None:
         p_no = 1 - p_yes
-        edge = p_no - market.best_ask_no - market.fee_rate
+        ask = market.best_ask_no
+        edge = p_no - ask - market.taker_fee_at(ask)
         if edge > settings.edge_threshold:
-            return _signal(market, "NO", market.best_ask_no, p_no, edge,
+            return _signal(market, "NO", ask, p_no, edge,
                            current_price, opening_price, sec_left)
     return None
 
@@ -70,7 +77,7 @@ def _signal(market: Market, side: str, ask: float, p: float, edge: float,
         "ts": time.time(), "slug": market.slug, "asset": market.asset,
         "side": side, "ask": ask, "fair_p": p, "edge": edge,
         "current": cur, "opening": opn, "sec_left": sec_left,
-        "fee_rate": market.fee_rate,
+        "fee": market.taker_fee_at(ask),
         "size_usdc": min(settings.max_position_usdc, settings.max_position_usdc * edge / 0.05),
     }
 
@@ -82,18 +89,31 @@ def log_paper(signal: dict) -> None:
 
 async def run_loop(feed: BinanceFeed, markets_provider) -> None:
     last_status = 0.0
+    # Dedup: only re-log a (slug, side) signal when ask price or fair_p changes.
+    last_sig: dict[tuple[str, str], tuple[float, float]] = {}
     while True:
         try:
             markets, openings = await markets_provider()
             now = time.time()
+            # Garbage-collect dedup state for finished markets.
+            live_slugs = {m.slug for m in markets}
+            for k in list(last_sig):
+                if k[0] not in live_slugs:
+                    last_sig.pop(k, None)
             for m in markets:
                 cur = feed.last_price.get(m.asset)
                 opn = openings.get(m.slug)
                 if cur is None or opn is None:
                     continue
                 sig = evaluate(m, cur, opn)
-                if sig:
-                    log_paper(sig)
+                if not sig:
+                    continue
+                key = (sig["slug"], sig["side"])
+                fingerprint = (round(sig["ask"], 4), round(sig["fair_p"], 3))
+                if last_sig.get(key) == fingerprint:
+                    continue
+                last_sig[key] = fingerprint
+                log_paper(sig)
             # Heartbeat every 30s so we know the loop is alive even if no signals.
             if now - last_status > 30:
                 in_window = sum(

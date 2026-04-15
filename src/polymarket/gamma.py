@@ -44,10 +44,24 @@ class Market:
     min_size: float
     tick_size: float
     fee_rate: float
+    fee_exponent: float
 
     @property
     def seconds_remaining(self) -> float:
         return self.end_ts - time.time()
+
+    def taker_fee_at(self, price: float) -> float:
+        """Polymarket dynamic taker fee, per QuantJourney's published formula:
+            fee = rate * (1 - 4*(p - 0.5)^2) ** exponent
+        Returned as a fraction of trade NOTIONAL (e.g. 0.048 = 4.8%).
+        Peak at p=0.5, zero at p in {0, 1}.
+        """
+        rate = self.fee_rate
+        exp = self.fee_exponent
+        if rate <= 0:
+            return 0.0
+        shape = max(0.0, 1.0 - 4.0 * (price - 0.5) ** 2)
+        return rate * (shape ** exp)
 
 
 def _upcoming_round_starts(now: float, lookahead_sec: int) -> list[int]:
@@ -84,7 +98,9 @@ def _parse_event(evt: dict) -> Market | None:
         return None
     if len(token_ids) != 2:
         return None
-    fee = (m.get("feeSchedule") or {}).get("rate", 0.0)
+    fee_sched = m.get("feeSchedule") or {}
+    fee_rate = float(fee_sched.get("rate", 0.0))
+    fee_exp = float(fee_sched.get("exponent", 1.0))
     # NOTE: bestBid/bestAsk in Gamma are the YES (Up) side. NO side prices
     # we approximate via complement (1 - yes_ask = no_bid implied) — for paper
     # mode that's fine; for live we should pull both books from CLOB.
@@ -100,7 +116,8 @@ def _parse_event(evt: dict) -> Market | None:
         best_bid_no=no_bid, best_ask_no=no_ask,
         min_size=float(m.get("orderMinSize", 5)),
         tick_size=float(m.get("orderPriceMinTickSize", 0.01)),
-        fee_rate=float(fee),
+        fee_rate=fee_rate,
+        fee_exponent=fee_exp,
     )
 
 
