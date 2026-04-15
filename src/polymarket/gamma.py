@@ -121,11 +121,31 @@ def _parse_event(evt: dict) -> Market | None:
     )
 
 
+CLOB_BOOK_URL = "https://clob.polymarket.com/book"
+
+
+async def _fetch_clob_top(client: httpx.AsyncClient, token_id: str
+                          ) -> tuple[float | None, float | None]:
+    """Return (best_bid, best_ask) from CLOB orderbook. None if empty/error."""
+    try:
+        r = await client.get(CLOB_BOOK_URL, params={"token_id": token_id}, timeout=3.0)
+        r.raise_for_status()
+        b = r.json()
+        bids = b.get("bids") or []
+        asks = b.get("asks") or []
+        best_bid = max((float(x["price"]) for x in bids), default=None)
+        best_ask = min((float(x["price"]) for x in asks), default=None)
+        return best_bid, best_ask
+    except (httpx.HTTPError, ValueError, KeyError):
+        return None, None
+
+
 async def fetch_active_markets(
     client: httpx.AsyncClient,
     horizon_sec: int = 600,
 ) -> list[Market]:
-    """Generate slugs for upcoming rounds, fetch in parallel."""
+    """Generate slugs for upcoming rounds, fetch Gamma metadata + LIVE CLOB books."""
+    import asyncio
     now = time.time()
     starts = _upcoming_round_starts(now, horizon_sec)
     slugs = [f"{ASSETS[a]}-updown-5m-{ts}" for a in ASSETS for ts in starts]
@@ -140,10 +160,21 @@ async def fetch_active_markets(
             data = r.json()
             if not data:
                 return None
-            return _parse_event(data[0])
+            m = _parse_event(data[0])
+            if not m:
+                return None
+            # Overwrite Gamma's cached bid/ask with live CLOB books (both sides).
+            (yes_bid, yes_ask), (no_bid, no_ask) = await asyncio.gather(
+                _fetch_clob_top(client, m.yes_token_id),
+                _fetch_clob_top(client, m.no_token_id),
+            )
+            # Return a new Market with fresh quotes (dataclass is frozen).
+            from dataclasses import replace
+            return replace(m,
+                           best_bid_yes=yes_bid, best_ask_yes=yes_ask,
+                           best_bid_no=no_bid, best_ask_no=no_ask)
         except (httpx.HTTPError, ValueError):
             return None
 
-    import asyncio
     results = await asyncio.gather(*(fetch_one(s) for s in slugs))
     return [m for m in results if m and m.seconds_remaining > 0]
