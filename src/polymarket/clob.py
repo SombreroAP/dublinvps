@@ -24,18 +24,21 @@ class PolyCLOB:
     """Thin wrapper over py-clob-client. Read-only for paper mode."""
 
     def __init__(self) -> None:
-        kwargs = dict(
+        # A real Polygon private key is 0x + 64 hex chars (66 total). Anything
+        # else (empty, placeholder "0x...", malformed) -> treat as no-key,
+        # which is fine for paper mode (orderbook reads are public).
+        key = settings.poly_private_key
+        has_real_key = isinstance(key, str) and key.startswith("0x") and len(key) == 66
+        kwargs: dict = dict(
             host=settings.poly_clob_host,
             chain_id=settings.poly_chain_id,
-            key=settings.poly_private_key or None,
-            signature_type=settings.poly_signature_type,
+            key=key if has_real_key else None,
+            signature_type=settings.poly_signature_type if has_real_key else 0,
         )
-        # sig_type 1 (Magic) or 2 (Safe) require a funder address — the proxy
-        # wallet where USDC actually lives.
-        if settings.poly_signature_type in (1, 2) and settings.poly_funder_address:
+        if has_real_key and settings.poly_signature_type in (1, 2) and settings.poly_funder_address:
             kwargs["funder"] = settings.poly_funder_address
         self._client = ClobClient(**kwargs)
-        if settings.mode == "live" and settings.poly_private_key:
+        if settings.mode == "live" and has_real_key:
             self._client.set_api_creds(self._client.create_or_derive_api_creds())
 
     def top_of_book(self, token_id: str) -> TopOfBook:
