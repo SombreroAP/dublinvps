@@ -110,7 +110,7 @@ Examples in [`py-clob-client/examples/`](https://github.com/Polymarket/py-clob-c
 
 ## Strategic decisions (locked in)
 
-- **Wallet:** pure EOA (`signature_type=0`). No UI dependency, simple headless key on Dublin VPS.
+- **Wallet:** Magic-proxy (`signature_type=1`) — user already has funded Polymarket account via email/Google login. Bot uses the Magic-issued EOA private key to sign, with the proxy address as `funder`. (Original plan was pure EOA but switched to reuse existing funded account.)
 - **Execution:** taker-capable with a hard edge gate. Require edge ≥ 2.5% (1.80% fee + 0.7% slippage/latency buffer) before firing. If live data shows threshold rarely hits, pivot to maker resting orders placed earlier in the round.
 - **Settlement clock:** 5m markets resolve on Chainlink Data Stream snapshots at exact round boundaries. Our edge = comparing live Binance/Coinbase price at T-30s to the Chainlink snapshot Polymarket will use at T+0. Monitor both feeds; the lag between them is where the mispricing lives.
 

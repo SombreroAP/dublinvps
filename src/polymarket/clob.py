@@ -24,12 +24,17 @@ class PolyCLOB:
     """Thin wrapper over py-clob-client. Read-only for paper mode."""
 
     def __init__(self) -> None:
-        self._client = ClobClient(
+        kwargs = dict(
             host=settings.poly_clob_host,
             chain_id=settings.poly_chain_id,
             key=settings.poly_private_key or None,
-            signature_type=0,  # pure EOA — see docs/polymarket-api-research.md
+            signature_type=settings.poly_signature_type,
         )
+        # sig_type 1 (Magic) or 2 (Safe) require a funder address — the proxy
+        # wallet where USDC actually lives.
+        if settings.poly_signature_type in (1, 2) and settings.poly_funder_address:
+            kwargs["funder"] = settings.poly_funder_address
+        self._client = ClobClient(**kwargs)
         if settings.mode == "live" and settings.poly_private_key:
             self._client.set_api_creds(self._client.create_or_derive_api_creds())
 

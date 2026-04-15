@@ -10,6 +10,8 @@ class Settings(BaseSettings):
 
     # Polymarket
     poly_private_key: str = ""
+    poly_funder_address: str = ""
+    poly_signature_type: int = 1  # 0=EOA, 1=Magic proxy, 2=Safe proxy
     poly_chain_id: int = 137
     poly_clob_host: str = "https://clob.polymarket.com"
     poly_gamma_host: str = "https://gamma-api.polymarket.com"
