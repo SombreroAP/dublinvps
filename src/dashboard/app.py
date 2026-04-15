@@ -131,10 +131,22 @@ def _compute_backtest() -> dict:
             status_ = res
             pending += 1
         tot_pl += pl
+        target = "UP" if side == "YES" else "DOWN"
+        live = _chainlink.last_price.get(r["asset"])
+        open_px = r.get("opening")
+        delta = (live - open_px) if (live is not None and open_px is not None) else None
+        # Is live trending toward winning? (only meaningful while open)
+        if delta is None:
+            trending = None
+        else:
+            trending = (target == "UP" and delta > 0) or (target == "DOWN" and delta < 0)
         picks.append({
             "ts": r["ts"], "slug": slug, "asset": r["asset"], "side": side,
+            "target": target,
             "ask": r["ask"], "fair_p": r["fair_p"], "edge": r["edge"],
             "fee": r["fee"], "size_usdc": r["size_usdc"],
+            "opening": open_px, "live": live, "delta": delta,
+            "trending": trending,
             "result": status_, "pl": pl,
         })
 
@@ -233,7 +245,7 @@ tr:hover td { background:#192029; }
 <div class="card" style="margin:0 16px 16px">
   <h2>Recent picks (best per market, most recent first)</h2>
   <table id="picks_tbl"><thead>
-    <tr><th>Time</th><th>Asset</th><th>Side</th><th>Ask</th><th>Fair p</th><th>Edge</th><th>Fee</th><th>Size</th><th>Result</th><th>P&amp;L</th><th>Slug</th></tr>
+    <tr><th>Time</th><th>Asset</th><th>Target</th><th>Ask</th><th>Fair p</th><th>Edge</th><th>Size</th><th>Open</th><th>Live</th><th>Δ</th><th>Result</th><th>P&amp;L</th><th>Slug</th></tr>
   </thead><tbody></tbody></table>
 </div>
 </div>
@@ -272,15 +284,31 @@ async function refresh() {
 
     const tbody = document.querySelector("#picks_tbl tbody");
     tbody.innerHTML = "";
+    const fmtPx = (v, a) => v==null ? "—" : (a==="SOL" ? v.toFixed(3) : v.toFixed(2));
     for (const p of bt.picks) {
       const tr = document.createElement("tr");
       const t = new Date(p.ts*1000).toLocaleTimeString();
       const plS = (p.pl>=0?"+":"") + "$" + p.pl.toFixed(2);
       const plCls = p.pl>0?"ok":p.pl<0?"bad":"mut";
-      tr.innerHTML = `<td class="mut">${t}</td><td>${p.asset}</td><td>${p.side}</td>
+      const tgtCls = p.target==="UP" ? "ok" : "bad";
+      const tgtArrow = p.target==="UP" ? "↑" : "↓";
+      let deltaCell = "—", deltaCls = "mut";
+      if (p.delta != null) {
+        const sign = p.delta>=0 ? "+" : "";
+        const deltaFmt = p.asset==="SOL" ? p.delta.toFixed(3) : p.delta.toFixed(2);
+        deltaCell = `${sign}${deltaFmt}`;
+        // color by trending (only visible distinction when open; for resolved it's just informational)
+        if (p.result==="open") deltaCls = p.trending ? "ok" : "bad";
+        else deltaCls = p.trending ? "mut" : "mut";
+      }
+      tr.innerHTML = `<td class="mut">${t}</td><td>${p.asset}</td>
+        <td class="${tgtCls}">${tgtArrow} ${p.target}</td>
         <td>${p.ask.toFixed(2)}</td><td>${p.fair_p.toFixed(2)}</td>
-        <td>${(p.edge*100).toFixed(1)}%</td><td>${(p.fee*100).toFixed(1)}%</td>
+        <td>${(p.edge*100).toFixed(1)}%</td>
         <td>$${p.size_usdc.toFixed(0)}</td>
+        <td>${fmtPx(p.opening, p.asset)}</td>
+        <td>${fmtPx(p.live, p.asset)}</td>
+        <td class="${deltaCls}">${deltaCell}</td>
         <td><span class="pill ${p.result}">${p.result}</span></td>
         <td class="${plCls}">${plS}</td><td class="mut">${p.slug}</td>`;
       tbody.appendChild(tr);
