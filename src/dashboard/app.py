@@ -74,7 +74,7 @@ def _fetch_live_ask(slug: str, side: str) -> float | None:
     key = (slug, side)
     now = time.time()
     hit = _live_ask_cache.get(key)
-    if hit and now - hit[0] < 1.5:
+    if hit and now - hit[0] < 1.0:
         return hit[1]
     try:
         raw = subprocess.check_output([
@@ -241,7 +241,7 @@ def _taker_fee(rate: float, exponent: float, price: float) -> float:
 def _compute_live_state() -> list[dict]:
     """Per-asset: nearest upcoming round + bot's current thinking."""
     global _live_state_cache
-    if _live_state_cache and time.time() - _live_state_cache[0] < 1.5:
+    if _live_state_cache and time.time() - _live_state_cache[0] < 1.0:
         return _live_state_cache[1]
 
     now = time.time()
@@ -336,6 +336,7 @@ def _compute_live_state() -> list[dict]:
         out.append({
             "asset": asset, "slug": slug,
             "round_start": round_start, "round_end": round_end,
+            "round_end_unix_ts": round_end,  # for client-side countdown
             "seconds_left": sec_left,
             "opening": opening, "current": cur, "delta": delta, "move_bps": move_bps,
             "yes_ask": yes_ask, "no_ask": no_ask,
@@ -460,7 +461,7 @@ tr:hover td { background:#192029; }
 </div>
 
 <div class="foot">
-  <div>auto-refresh every 0.75s · dashboard uptime <span id="uptime">—</span></div>
+  <div>timer 200ms · poll 500ms · CLOB ~1s · dashboard uptime <span id="uptime">—</span></div>
   <div>bot: <span id="bot_status" class="mut">—</span></div>
 </div>
 
@@ -470,6 +471,50 @@ function dur(s) {
   const h = Math.floor(s/3600), m = Math.floor((s%3600)/60);
   return h>0 ? `${h}h${m}m` : `${m}m`;
 }
+function fmtPxJS(v, a) { return v==null ? "—" : (a==="SOL" ? v.toFixed(3) : v.toFixed(2)); }
+
+// Re-renders the 3 per-asset cards using the latest server snapshot plus
+// CLIENT-SIDE clock for the countdown, so the timer ticks smoothly at 200ms
+// regardless of how fast the server poll is.
+function renderAssetCards() {
+  const snapshot = window._liveSnapshot || [];
+  const entryStart = 45, entryEnd = 5;
+  const now = Date.now() / 1000;
+  for (const s of snapshot) {
+    const el = document.getElementById("live_" + s.asset);
+    if (!el) continue;
+    const body = el.querySelector(".live_body");
+    const secLeft = s.round_end_unix_ts ? Math.max(0, s.round_end_unix_ts - now) : s.seconds_left;
+    const secInt = secLeft|0;
+    const mmss = `${Math.floor(Math.max(0,secInt)/60)}:${String(Math.max(0,secInt)%60).padStart(2,"0")}`;
+    const inWin = (entryEnd < secLeft && secLeft <= entryStart);
+    const dirCls = s.move_bps==null ? "mut" : (s.move_bps>0 ? "ok" : s.move_bps<0 ? "bad" : "mut");
+    const dirArrow = s.move_bps==null ? "—" : (s.move_bps>=0 ? "↑" : "↓");
+    const moveStr = s.move_bps==null ? "—" : `${dirArrow} ${s.move_bps>=0?"+":""}${s.move_bps.toFixed(1)} bps`;
+    // Color Live px vs Open px: green if higher, red if lower.
+    let liveCls = "mut";
+    if (s.current != null && s.opening != null) {
+      if (s.current > s.opening) liveCls = "ok";
+      else if (s.current < s.opening) liveCls = "bad";
+    }
+    const edgeStr = s.best_edge==null ? "—" :
+      `<span class="${s.best_edge>s.threshold?"ok":"mut"}">${s.best_side} ${(s.best_edge*100).toFixed(1)}%</span>`;
+    let stateCls = "mut";
+    if (s.action) stateCls = "ok";
+    else if (inWin) stateCls = "warn";
+    body.innerHTML = `
+      <div class="kv"><span class="k">Round ends in</span><span class="v ${inWin?"warn":""}">${mmss} ${inWin?"· IN WINDOW":""}</span></div>
+      <div class="kv"><span class="k">Open px</span><span class="v">${fmtPxJS(s.opening, s.asset)}</span></div>
+      <div class="kv"><span class="k">Live px</span><span class="v ${liveCls}">${fmtPxJS(s.current, s.asset)}</span></div>
+      <div class="kv"><span class="k">Move</span><span class="v ${dirCls}">${moveStr}</span></div>
+      <div class="kv"><span class="k">YES ask / NO ask</span><span class="v">${s.yes_ask==null?"—":s.yes_ask.toFixed(2)} / ${s.no_ask==null?"—":s.no_ask.toFixed(2)}</span></div>
+      <div class="kv"><span class="k">Fair p (YES)</span><span class="v">${s.fair_p_yes==null?"—":s.fair_p_yes.toFixed(2)}</span></div>
+      <div class="kv"><span class="k">Best edge</span><span class="v">${edgeStr}</span></div>
+      <div style="margin-top:8px; padding:8px; background:#0f141a; border-radius:6px; font-size:12px" class="${stateCls}">${s.state}</div>
+    `;
+  }
+}
+setInterval(renderAssetCards, 200);
 async function refresh() {
   try {
     const r = await fetch("/api/summary", { credentials: "include" });
@@ -493,33 +538,10 @@ async function refresh() {
 
     const fmtPx = (v, a) => v==null ? "—" : (a==="SOL" ? v.toFixed(3) : v.toFixed(2));
 
-    // Per-asset live cards
-    for (const s of (d.live || [])) {
-      const el = document.getElementById("live_" + s.asset);
-      if (!el) continue;
-      const body = el.querySelector(".live_body");
-      const secLeft = s.seconds_left|0;
-      const mmss = `${Math.floor(Math.max(0,secLeft)/60)}:${String(Math.max(0,secLeft)%60).padStart(2,"0")}`;
-      const inWin = s.in_window;
-      const dir = s.move_bps==null ? "—" : (s.move_bps>=0 ? "↑" : "↓");
-      const dirCls = s.move_bps==null ? "mut" : (s.move_bps>0 ? "ok" : s.move_bps<0 ? "bad" : "mut");
-      const moveStr = s.move_bps==null ? "—" : `${dir} ${s.move_bps>=0?"+":""}${s.move_bps.toFixed(1)} bps`;
-      const edgeStr = s.best_edge==null ? "—" :
-        `<span class="${s.best_edge>s.threshold?"ok":"mut"}">${s.best_side} ${(s.best_edge*100).toFixed(1)}%</span>`;
-      let stateCls = "mut";
-      if (s.action) stateCls = "ok";
-      else if (inWin) stateCls = "warn";
-      body.innerHTML = `
-        <div class="kv"><span class="k">Round ends in</span><span class="v ${inWin?"warn":""}">${mmss} ${inWin?"· IN WINDOW":""}</span></div>
-        <div class="kv"><span class="k">Open px</span><span class="v">${fmtPx(s.opening, s.asset)}</span></div>
-        <div class="kv"><span class="k">Live px</span><span class="v">${fmtPx(s.current, s.asset)}</span></div>
-        <div class="kv"><span class="k">Move</span><span class="v ${dirCls}">${moveStr}</span></div>
-        <div class="kv"><span class="k">YES ask / NO ask</span><span class="v">${s.yes_ask==null?"—":s.yes_ask.toFixed(2)} / ${s.no_ask==null?"—":s.no_ask.toFixed(2)}</span></div>
-        <div class="kv"><span class="k">Fair p (YES)</span><span class="v">${s.fair_p_yes==null?"—":s.fair_p_yes.toFixed(2)}</span></div>
-        <div class="kv"><span class="k">Best edge</span><span class="v">${edgeStr}</span></div>
-        <div style="margin-top:8px; padding:8px; background:#0f141a; border-radius:6px; font-size:12px" class="${stateCls}">${s.state}</div>
-      `;
-    }
+    // Stash for the client-side ticker (renderAssetCards runs every 200ms).
+    window._liveSnapshot = d.live || [];
+    window._threshold = (d.live && d.live[0]) ? d.live[0].threshold : 0.025;
+    renderAssetCards();
 
     const activeBody = document.querySelector("#active_tbl tbody");
     const pendingBody = document.querySelector("#pending_tbl tbody");
@@ -616,7 +638,7 @@ async function refresh() {
     document.getElementById("status").textContent = "ERR";
   }
 }
-refresh(); setInterval(refresh, 750);
+refresh(); setInterval(refresh, 500);
 </script>
 </body></html>
 """
