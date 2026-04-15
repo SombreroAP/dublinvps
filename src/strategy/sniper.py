@@ -85,6 +85,10 @@ async def evaluate_and_log(
     if side is None:
         return
 
+    # Require high model confidence. Data showed fair_p<0.85 wins ~25%.
+    if target_p < settings.min_fair_p:
+        return
+
     # Cheap pre-filter: if cached ask is already way above fair, don't even
     # bother with the live refetch. Leave a small tolerance since fresh price
     # could be slightly cheaper.
