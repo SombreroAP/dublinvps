@@ -124,11 +124,14 @@ def _parse_event(evt: dict) -> Market | None:
 CLOB_BOOK_URL = "https://clob.polymarket.com/book"
 
 
-async def _fetch_clob_top(client: httpx.AsyncClient, token_id: str
+async def fetch_clob_top(client: httpx.AsyncClient, token_id: str
                           ) -> tuple[float | None, float | None]:
-    """Return (best_bid, best_ask) from CLOB orderbook. None if empty/error."""
+    """Return (best_bid, best_ask) from CLOB orderbook. None if empty/error.
+    Public: used both at market-discovery refresh AND on-demand inside the
+    sniper's decision loop to get a sub-second-fresh ask before firing.
+    """
     try:
-        r = await client.get(CLOB_BOOK_URL, params={"token_id": token_id}, timeout=3.0)
+        r = await client.get(CLOB_BOOK_URL, params={"token_id": token_id}, timeout=2.0)
         r.raise_for_status()
         b = r.json()
         bids = b.get("bids") or []
@@ -138,6 +141,10 @@ async def _fetch_clob_top(client: httpx.AsyncClient, token_id: str
         return best_bid, best_ask
     except (httpx.HTTPError, ValueError, KeyError):
         return None, None
+
+
+# Backward-compat alias for internal callers
+_fetch_clob_top = fetch_clob_top
 
 
 async def fetch_active_markets(

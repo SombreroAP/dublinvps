@@ -31,7 +31,7 @@ async def main() -> None:
     bn_task = asyncio.create_task(binance.run())
 
     cache: dict = {"markets": [], "fetched_at": 0.0}
-    GAMMA_TTL = 10.0
+    GAMMA_TTL = 3.0
     openings: dict[str, float] = {}
 
     async with httpx.AsyncClient() as http:
