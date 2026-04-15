@@ -203,6 +203,138 @@ def _compute_backtest() -> dict:
     return result
 
 
+_live_state_cache: tuple[float, list] | None = None
+
+
+def _fair_yes_p(current: float, opening: float, seconds_left: float) -> float:
+    """Mirror of strategy.sniper.fair_yes_probability — keep in sync."""
+    if seconds_left <= 0:
+        return 1.0 if current >= opening else 0.0
+    move_bps = (current - opening) / opening * 10_000
+    if seconds_left < 10 and abs(move_bps) > 1:
+        return 0.99 if move_bps > 0 else 0.01
+    if seconds_left < 30 and abs(move_bps) > 3:
+        return 0.95 if move_bps > 0 else 0.05
+    if seconds_left < 45 and abs(move_bps) > 5:
+        return 0.85 if move_bps > 0 else 0.15
+    return 0.5 + (0.05 if move_bps > 0 else -0.05)
+
+
+def _taker_fee(rate: float, exponent: float, price: float) -> float:
+    if rate <= 0:
+        return 0.0
+    shape = max(0.0, 1.0 - 4.0 * (price - 0.5) ** 2)
+    return rate * (shape ** exponent)
+
+
+def _compute_live_state() -> list[dict]:
+    """Per-asset: nearest upcoming round + bot's current thinking."""
+    global _live_state_cache
+    if _live_state_cache and time.time() - _live_state_cache[0] < 2:
+        return _live_state_cache[1]
+
+    now = time.time()
+    ENTRY_START, ENTRY_END = settings.entry_window_start_sec, settings.entry_window_end_sec
+    out = []
+    for asset_short, asset in [("btc", "BTC"), ("eth", "ETH"), ("sol", "SOL")]:
+        # Pick the nearest round that hasn't ended yet.
+        base = (int(now) // 300) * 300
+        for offset in (0, 300, 600):
+            round_start = base + offset
+            round_end = round_start + 300
+            if round_end > now:
+                break
+        slug = f"{asset_short}-updown-5m-{round_start}"
+        sec_left = round_end - now
+        cur = _chainlink.last_price.get(asset)
+        opening = _chainlink.opening_at(asset, round_start)
+
+        yes_ask = no_ask = None
+        fee_rate = fee_exp = None
+        try:
+            raw = subprocess.check_output([
+                "curl", "-s", "-H", "User-Agent: Mozilla/5.0",
+                f"https://gamma-api.polymarket.com/events?slug={slug}",
+            ], timeout=4)
+            d = json.loads(raw)
+            if d:
+                m = d[0]["markets"][0]
+                tokens = json.loads(m.get("clobTokenIds") or "[]")
+                fee_sched = m.get("feeSchedule") or {}
+                fee_rate = float(fee_sched.get("rate", 0.0))
+                fee_exp = float(fee_sched.get("exponent", 1.0))
+                if len(tokens) == 2:
+                    for label, tid, target in [("yes", tokens[0], "yes_ask"),
+                                                ("no", tokens[1], "no_ask")]:
+                        try:
+                            rb = subprocess.check_output([
+                                "curl", "-s",
+                                f"https://clob.polymarket.com/book?token_id={tid}",
+                            ], timeout=3)
+                            bk = json.loads(rb)
+                            asks = bk.get("asks") or []
+                            val = min((float(x["price"]) for x in asks), default=None)
+                            if target == "yes_ask":
+                                yes_ask = val
+                            else:
+                                no_ask = val
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+        # Compute fair_p + edges + decision
+        fair_p = None
+        best_side = None
+        best_edge = None
+        best_ask = None
+        in_window = ENTRY_END < sec_left <= ENTRY_START
+        if cur is not None and opening is not None:
+            fair_p = _fair_yes_p(cur, opening, sec_left)
+            if fair_p > 0.5 and yes_ask is not None and fee_rate is not None:
+                e = fair_p - yes_ask - _taker_fee(fee_rate, fee_exp, yes_ask)
+                if best_edge is None or e > best_edge:
+                    best_edge, best_side, best_ask = e, "YES", yes_ask
+            if fair_p < 0.5 and no_ask is not None and fee_rate is not None:
+                p_no = 1 - fair_p
+                e = p_no - no_ask - _taker_fee(fee_rate, fee_exp, no_ask)
+                if best_edge is None or e > best_edge:
+                    best_edge, best_side, best_ask = e, "NO", no_ask
+
+        # Decision string
+        threshold = settings.edge_threshold
+        if not in_window:
+            if sec_left > ENTRY_START:
+                state = f"waiting — window opens in {int(sec_left - ENTRY_START)}s"
+            else:
+                state = f"past entry window (T-{max(0, int(sec_left))}s)"
+            action = None
+        elif best_edge is None or best_edge <= threshold:
+            state = f"in window — no edge (best {((best_edge or 0)*100):+.1f}%)"
+            action = None
+        else:
+            state = f"in window — would buy {best_side} @ {best_ask:.2f} (edge {best_edge*100:.1f}%)"
+            action = {"side": best_side, "ask": best_ask, "edge": best_edge}
+
+        delta = (cur - opening) if (cur is not None and opening is not None) else None
+        move_bps = ((cur - opening) / opening * 10_000) if delta is not None else None
+
+        out.append({
+            "asset": asset, "slug": slug,
+            "round_start": round_start, "round_end": round_end,
+            "seconds_left": sec_left,
+            "opening": opening, "current": cur, "delta": delta, "move_bps": move_bps,
+            "yes_ask": yes_ask, "no_ask": no_ask,
+            "fair_p_yes": fair_p,
+            "best_side": best_side, "best_edge": best_edge, "best_ask": best_ask,
+            "in_window": in_window, "state": state, "action": action,
+            "threshold": threshold,
+        })
+
+    _live_state_cache = (time.time(), out)
+    return out
+
+
 def _bot_status() -> dict:
     try:
         out = subprocess.check_output(
@@ -226,6 +358,7 @@ def api_summary(_=Depends(_check_auth)) -> JSONResponse:
             "last_update_ms": _chainlink.last_ts_ms,
         },
         "backtest": bt,
+        "live": _compute_live_state(),
     })
 
 
@@ -282,10 +415,24 @@ tr:hover td { background:#192029; }
   </div>
 </div>
 
+<div class="grid" style="padding:0 16px 16px">
+  <div class="card" id="live_BTC"><h2>BTC · next round</h2><div class="live_body mut">loading…</div></div>
+  <div class="card" id="live_ETH"><h2>ETH · next round</h2><div class="live_body mut">loading…</div></div>
+  <div class="card" id="live_SOL"><h2>SOL · next round</h2><div class="live_body mut">loading…</div></div>
+</div>
+
+<div class="card" style="margin:0 16px 16px; border-color:#2d4a2d">
+  <h2 style="color:#3fb950">● Open positions <span id="open_count" class="mut" style="font-weight:400"></span></h2>
+  <table id="open_tbl"><thead>
+    <tr><th>Time</th><th>Asset</th><th>Target</th><th>Ask</th><th>Live ask</th><th>Fair p</th><th>Edge</th><th>Size</th><th>Open px</th><th>Live px</th><th>Δ</th><th>Slug</th></tr>
+  </thead><tbody></tbody></table>
+  <div id="open_empty" class="mut" style="padding:12px 4px; display:none">No open positions. Next entry window will create new picks.</div>
+</div>
+
 <div class="card" style="margin:0 16px 16px">
-  <h2>Recent picks (best per market, most recent first)</h2>
+  <h2>Recent resolved picks</h2>
   <table id="picks_tbl"><thead>
-    <tr><th>Time</th><th>Asset</th><th>Target</th><th>Ask</th><th>Live ask</th><th>Fair p</th><th>Edge</th><th>Size</th><th>Open</th><th>Live</th><th>Δ</th><th>Result</th><th>P&amp;L</th><th>Slug</th></tr>
+    <tr><th>Time</th><th>Asset</th><th>Target</th><th>Ask</th><th>Fair p</th><th>Edge</th><th>Size</th><th>Open px</th><th>Result</th><th>P&amp;L</th><th>Slug</th></tr>
   </thead><tbody></tbody></table>
 </div>
 </div>
@@ -322,32 +469,61 @@ async function refresh() {
     document.getElementById("p_eth").textContent = cl.ETH ? "$"+cl.ETH.toFixed(2) : "—";
     document.getElementById("p_sol").textContent = cl.SOL ? "$"+cl.SOL.toFixed(3) : "—";
 
-    const tbody = document.querySelector("#picks_tbl tbody");
-    tbody.innerHTML = "";
     const fmtPx = (v, a) => v==null ? "—" : (a==="SOL" ? v.toFixed(3) : v.toFixed(2));
-    for (const p of bt.picks) {
-      const tr = document.createElement("tr");
+
+    // Per-asset live cards
+    for (const s of (d.live || [])) {
+      const el = document.getElementById("live_" + s.asset);
+      if (!el) continue;
+      const body = el.querySelector(".live_body");
+      const secLeft = s.seconds_left|0;
+      const inWin = s.in_window;
+      const dir = s.move_bps==null ? "—" : (s.move_bps>=0 ? "↑" : "↓");
+      const dirCls = s.move_bps==null ? "mut" : (s.move_bps>0 ? "ok" : s.move_bps<0 ? "bad" : "mut");
+      const moveStr = s.move_bps==null ? "—" : `${dir} ${s.move_bps>=0?"+":""}${s.move_bps.toFixed(1)} bps`;
+      const edgeStr = s.best_edge==null ? "—" :
+        `<span class="${s.best_edge>s.threshold?"ok":"mut"}">${s.best_side} ${(s.best_edge*100).toFixed(1)}%</span>`;
+      let stateCls = "mut";
+      if (s.action) stateCls = "ok";
+      else if (inWin) stateCls = "warn";
+      body.innerHTML = `
+        <div class="kv"><span class="k">Round ends in</span><span class="v ${inWin?"warn":""}">${secLeft}s ${inWin?"· IN WINDOW":""}</span></div>
+        <div class="kv"><span class="k">Open px</span><span class="v">${fmtPx(s.opening, s.asset)}</span></div>
+        <div class="kv"><span class="k">Live px</span><span class="v">${fmtPx(s.current, s.asset)}</span></div>
+        <div class="kv"><span class="k">Move</span><span class="v ${dirCls}">${moveStr}</span></div>
+        <div class="kv"><span class="k">YES ask / NO ask</span><span class="v">${s.yes_ask==null?"—":s.yes_ask.toFixed(2)} / ${s.no_ask==null?"—":s.no_ask.toFixed(2)}</span></div>
+        <div class="kv"><span class="k">Fair p (YES)</span><span class="v">${s.fair_p_yes==null?"—":s.fair_p_yes.toFixed(2)}</span></div>
+        <div class="kv"><span class="k">Best edge</span><span class="v">${edgeStr}</span></div>
+        <div style="margin-top:8px; padding:8px; background:#0f141a; border-radius:6px; font-size:12px" class="${stateCls}">${s.state}</div>
+      `;
+    }
+
+    const openBody = document.querySelector("#open_tbl tbody");
+    const resBody = document.querySelector("#picks_tbl tbody");
+    openBody.innerHTML = ""; resBody.innerHTML = "";
+    const openPicks = bt.picks.filter(p => p.result === "open");
+    const resolvedPicks = bt.picks.filter(p => p.result !== "open");
+    document.getElementById("open_count").textContent = openPicks.length ? `(${openPicks.length})` : "";
+    document.getElementById("open_empty").style.display = openPicks.length ? "none" : "block";
+
+    for (const p of openPicks) {
       const t = new Date(p.ts*1000).toLocaleTimeString();
-      const plS = (p.pl>=0?"+":"") + "$" + p.pl.toFixed(2);
-      const plCls = p.pl>0?"ok":p.pl<0?"bad":"mut";
       const tgtCls = p.target==="UP" ? "ok" : "bad";
       const tgtArrow = p.target==="UP" ? "↑" : "↓";
       let deltaCell = "—", deltaCls = "mut";
-      // Only show Δ for OPEN positions — for resolved, post-round drift is misleading.
-      if (p.delta != null && p.result === "open") {
+      if (p.delta != null) {
         const sign = p.delta>=0 ? "+" : "";
         const deltaFmt = p.asset==="SOL" ? p.delta.toFixed(3) : p.delta.toFixed(2);
         deltaCell = `${sign}${deltaFmt}`;
         deltaCls = p.trending ? "ok" : "bad";
       }
-      // Live ask: show only for open; color vs entry ask (lower = market moved
-      // in our direction; higher = against).
       let liveAskCell = "—", liveAskCls = "mut";
-      if (p.live_ask != null && p.result === "open") {
+      if (p.live_ask != null) {
         liveAskCell = p.live_ask.toFixed(2);
-        if (p.live_ask < p.ask) liveAskCls = "ok";      // cheaper than entry = good
-        else if (p.live_ask > p.ask) liveAskCls = "bad"; // more expensive = against
+        if (p.live_ask < p.ask) liveAskCls = "ok";
+        else if (p.live_ask > p.ask) liveAskCls = "bad";
       }
+      const tr = document.createElement("tr");
       tr.innerHTML = `<td class="mut">${t}</td><td>${p.asset}</td>
         <td class="${tgtCls}">${tgtArrow} ${p.target}</td>
         <td>${p.ask.toFixed(2)}</td>
@@ -358,9 +534,27 @@ async function refresh() {
         <td>${fmtPx(p.opening, p.asset)}</td>
         <td>${fmtPx(p.live, p.asset)}</td>
         <td class="${deltaCls}">${deltaCell}</td>
+        <td class="mut">${p.slug}</td>`;
+      openBody.appendChild(tr);
+    }
+
+    for (const p of resolvedPicks) {
+      const t = new Date(p.ts*1000).toLocaleTimeString();
+      const plS = (p.pl>=0?"+":"") + "$" + p.pl.toFixed(2);
+      const plCls = p.pl>0?"ok":p.pl<0?"bad":"mut";
+      const tgtCls = p.target==="UP" ? "ok" : "bad";
+      const tgtArrow = p.target==="UP" ? "↑" : "↓";
+      const tr = document.createElement("tr");
+      tr.innerHTML = `<td class="mut">${t}</td><td>${p.asset}</td>
+        <td class="${tgtCls}">${tgtArrow} ${p.target}</td>
+        <td>${p.ask.toFixed(2)}</td>
+        <td>${p.fair_p.toFixed(2)}</td>
+        <td>${(p.edge*100).toFixed(1)}%</td>
+        <td>$${p.size_usdc.toFixed(0)}</td>
+        <td>${fmtPx(p.opening, p.asset)}</td>
         <td><span class="pill ${p.result}">${p.result}</span></td>
         <td class="${plCls}">${plS}</td><td class="mut">${p.slug}</td>`;
-      tbody.appendChild(tr);
+      resBody.appendChild(tr);
     }
 
     const up = d.dashboard_uptime_sec;
