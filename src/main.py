@@ -15,6 +15,7 @@ import httpx
 
 from src.config import settings
 from src.feeds.binance import BinanceFeed
+from src.feeds.book_logger import run as run_book_logger
 from src.feeds.chainlink import ChainlinkFeed
 from src.logging_setup import configure, log
 from src.polymarket.gamma import Market, fetch_active_markets
@@ -55,7 +56,12 @@ async def main() -> None:
                              round_start=round_start, value=op)
             return cache["markets"], openings
 
-        await asyncio.gather(cl_task, bn_task, run_loop(chainlink, provider))
+        await asyncio.gather(
+            cl_task,
+            bn_task,
+            run_loop(chainlink, provider),
+            run_book_logger(provider),
+        )
 
 
 if __name__ == "__main__":

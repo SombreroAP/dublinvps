@@ -21,7 +21,7 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-ReadWritePaths=/opt/sniper/logs /opt/sniper/paper_trades.jsonl
+ReadWritePaths=/opt/sniper/logs /opt/sniper/paper_trades.jsonl /opt/sniper/orderbooks
 
 [Install]
 WantedBy=multi-user.target
