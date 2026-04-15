@@ -175,6 +175,15 @@ def _compute_backtest() -> dict:
         # Live ask only makes sense for open markets (and we don't want to hammer
         # CLOB for resolved ones).
         live_ask = _fetch_live_ask(slug, side) if status_ == "open" else None
+        # "open" splits into (a) round still running vs (b) ended, awaiting
+        # resolution. Slug timestamp = round-start; round-end = +300.
+        phase = status_
+        if status_ == "open":
+            try:
+                round_start = int(slug.split("-")[-1])
+                phase = "active" if (round_start + 300) > time.time() else "pending"
+            except (ValueError, IndexError):
+                phase = "active"
         # Is live trending toward winning? (only meaningful while open)
         if delta is None:
             trending = None
@@ -186,7 +195,7 @@ def _compute_backtest() -> dict:
             "ask": r["ask"], "fair_p": r["fair_p"], "edge": r["edge"],
             "fee": r["fee"], "size_usdc": r["size_usdc"],
             "opening": open_px, "live": live, "delta": delta,
-            "live_ask": live_ask, "trending": trending,
+            "live_ask": live_ask, "trending": trending, "phase": phase,
             "result": status_, "pl": pl,
         })
 
@@ -425,11 +434,19 @@ tr:hover td { background:#192029; }
 </div>
 
 <div class="card" style="margin:0 16px 16px; border-color:#2d4a2d">
-  <h2 style="color:#3fb950">● Open positions <span id="open_count" class="mut" style="font-weight:400"></span></h2>
-  <table id="open_tbl"><thead>
+  <h2 style="color:#3fb950">● Active round <span id="active_count" class="mut" style="font-weight:400"></span></h2>
+  <table id="active_tbl"><thead>
     <tr><th>Time</th><th>Asset</th><th>Target</th><th>Ask</th><th>Live ask</th><th>Fair p</th><th>Edge</th><th>Size</th><th>Open px</th><th>Live px</th><th>Δ</th><th>Slug</th></tr>
   </thead><tbody></tbody></table>
-  <div id="open_empty" class="mut" style="padding:12px 4px; display:none">No open positions. Next entry window will create new picks.</div>
+  <div id="active_empty" class="mut" style="padding:12px 4px; display:none">No picks in the currently-active round.</div>
+</div>
+
+<div class="card" style="margin:0 16px 16px; border-color:#4a3d1a">
+  <h2 style="color:#d29922">⏳ Waiting to resolve <span id="pending_count" class="mut" style="font-weight:400"></span></h2>
+  <table id="pending_tbl"><thead>
+    <tr><th>Time</th><th>Asset</th><th>Target</th><th>Ask</th><th>Fair p</th><th>Edge</th><th>Size</th><th>Open px</th><th>Close px</th><th>Slug</th></tr>
+  </thead><tbody></tbody></table>
+  <div id="pending_empty" class="mut" style="padding:12px 4px; display:none">No picks awaiting resolution.</div>
 </div>
 
 <div class="card" style="margin:0 16px 16px">
@@ -502,15 +519,19 @@ async function refresh() {
       `;
     }
 
-    const openBody = document.querySelector("#open_tbl tbody");
+    const activeBody = document.querySelector("#active_tbl tbody");
+    const pendingBody = document.querySelector("#pending_tbl tbody");
     const resBody = document.querySelector("#picks_tbl tbody");
-    openBody.innerHTML = ""; resBody.innerHTML = "";
-    const openPicks = bt.picks.filter(p => p.result === "open");
+    activeBody.innerHTML = ""; pendingBody.innerHTML = ""; resBody.innerHTML = "";
+    const activePicks = bt.picks.filter(p => p.phase === "active");
+    const pendingPicks = bt.picks.filter(p => p.phase === "pending");
     const resolvedPicks = bt.picks.filter(p => p.result !== "open");
-    document.getElementById("open_count").textContent = openPicks.length ? `(${openPicks.length})` : "";
-    document.getElementById("open_empty").style.display = openPicks.length ? "none" : "block";
+    document.getElementById("active_count").textContent = activePicks.length ? `(${activePicks.length})` : "";
+    document.getElementById("active_empty").style.display = activePicks.length ? "none" : "block";
+    document.getElementById("pending_count").textContent = pendingPicks.length ? `(${pendingPicks.length})` : "";
+    document.getElementById("pending_empty").style.display = pendingPicks.length ? "none" : "block";
 
-    for (const p of openPicks) {
+    for (const p of activePicks) {
       const t = new Date(p.ts*1000).toLocaleTimeString();
       const tgtCls = p.target==="UP" ? "ok" : "bad";
       const tgtArrow = p.target==="UP" ? "↑" : "↓";
@@ -539,7 +560,25 @@ async function refresh() {
         <td>${fmtPx(p.live, p.asset)}</td>
         <td class="${deltaCls}">${deltaCell}</td>
         <td class="mut">${p.slug}</td>`;
-      openBody.appendChild(tr);
+      activeBody.appendChild(tr);
+    }
+
+    // Pending resolution: round ended, just waiting on Polymarket to write the outcome.
+    for (const p of pendingPicks) {
+      const t = new Date(p.ts*1000).toLocaleTimeString();
+      const tgtCls = p.target==="UP" ? "ok" : "bad";
+      const tgtArrow = p.target==="UP" ? "↑" : "↓";
+      const tr = document.createElement("tr");
+      tr.innerHTML = `<td class="mut">${t}</td><td>${p.asset}</td>
+        <td class="${tgtCls}">${tgtArrow} ${p.target}</td>
+        <td>${p.ask.toFixed(2)}</td>
+        <td>${p.fair_p.toFixed(2)}</td>
+        <td>${(p.edge*100).toFixed(1)}%</td>
+        <td>$${p.size_usdc.toFixed(0)}</td>
+        <td>${fmtPx(p.opening, p.asset)}</td>
+        <td>${fmtPx(p.live, p.asset)}</td>
+        <td class="mut">${p.slug}</td>`;
+      pendingBody.appendChild(tr);
     }
 
     for (const p of resolvedPicks) {
