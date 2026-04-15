@@ -236,6 +236,98 @@ def _compute_backtest() -> dict:
 
 _live_state_cache: tuple[float, list] | None = None
 _ladder_cache: tuple[float, dict] | None = None
+# Cache of (slug, side_label) -> list of (price, size, ts) trades on the winning token.
+_trades_cache: dict[str, tuple[float, dict]] = {}
+
+
+def _fetch_market_trades(slug: str) -> dict:
+    """Fetch trades for a 5m market. Returns:
+        {'condition_id': str, 'yes_token': str, 'no_token': str, 'trades': [...]}
+    where trades is a list of {price, size, timestamp, asset} dicts.
+    Cached 5min per slug (trades for resolved markets don't change).
+    """
+    now = time.time()
+    hit = _trades_cache.get(slug)
+    if hit and now - hit[0] < 300:
+        return hit[1]
+
+    out: dict = {"condition_id": "", "yes_token": "", "no_token": "", "trades": []}
+    try:
+        raw = subprocess.check_output([
+            "curl", "-s", "-H", "User-Agent: Mozilla/5.0",
+            f"https://gamma-api.polymarket.com/events?slug={slug}",
+        ], timeout=6)
+        d = json.loads(raw)
+        if not d:
+            _trades_cache[slug] = (now, out)
+            return out
+        m = d[0]["markets"][0]
+        tokens = json.loads(m.get("clobTokenIds") or "[]")
+        if len(tokens) != 2:
+            _trades_cache[slug] = (now, out)
+            return out
+        out["condition_id"] = m["conditionId"]
+        out["yes_token"] = str(tokens[0])
+        out["no_token"] = str(tokens[1])
+
+        # Fetch trades for this conditionId. Paginate by offset.
+        all_trades: list[dict] = []
+        for offset in (0, 500, 1000):
+            try:
+                raw = subprocess.check_output([
+                    "curl", "-s", "-H", "User-Agent: Mozilla/5.0",
+                    f"https://data-api.polymarket.com/trades"
+                    f"?market={out['condition_id']}&limit=500&offset={offset}",
+                ], timeout=8)
+                page = json.loads(raw)
+                if not isinstance(page, list) or not page:
+                    break
+                all_trades.extend(page)
+                if len(page) < 500:
+                    break
+            except Exception:
+                break
+        out["trades"] = all_trades
+    except Exception:
+        pass
+    _trades_cache[slug] = (now, out)
+    return out
+
+
+def _simulate_fills(rungs: list, winning_token: str, trades: list[dict],
+                    round_start: int, round_end: int) -> tuple[float, list]:
+    """For each ladder rung at price P, check if our maker bid would have been
+    filled by inspecting actual trades on the winning token within the round
+    window.
+
+    Conservative model: rung fills at posted price IF total trade volume on the
+    winning token at price <= P during the round window >= our share size.
+    (Approximates queue priority: if someone got filled at our price level
+    AND there was enough volume, our order was probably in the queue too.)
+
+    Returns (total_winning_shares, [{price, usdc, filled, fill_reason}, ...]).
+    """
+    in_window = [
+        (float(t["price"]), float(t["size"]), int(t["timestamp"]))
+        for t in trades
+        if str(t.get("asset", "")) == winning_token
+        and round_start - 5 <= int(t.get("timestamp", 0)) <= round_end + 30
+    ]
+    breakdown = []
+    total_shares = 0.0
+    for rung_price, usdc in rungs:
+        my_shares = usdc / rung_price if rung_price > 0 else 0
+        # Volume traded at-or-below our bid price during the round window
+        vol_at_or_below = sum(sz for px, sz, _ in in_window if px <= rung_price + 1e-9)
+        filled = vol_at_or_below >= my_shares
+        breakdown.append({
+            "price": rung_price, "usdc": usdc, "my_shares": my_shares,
+            "traded_vol_at_or_below": vol_at_or_below,
+            "filled": filled,
+        })
+        if filled:
+            total_shares += my_shares
+    return total_shares, breakdown
 
 
 def _compute_ladder_backtest() -> dict:
@@ -259,22 +351,45 @@ def _compute_ladder_backtest() -> dict:
         by_key[(r["slug"], r["side"])] = r
 
     picks = []
-    tot_pl = 0.0
+    tot_pl = 0.0           # OPTIMISTIC: assume all rungs fill
+    tot_pl_real = 0.0      # REALISTIC: only rungs the market traded through fill
+    tot_staked_real = 0.0
     wins = losses = pending = 0
     total_staked = 0.0
     for (slug, side), r in sorted(by_key.items(), key=lambda kv: kv[1]["ts"], reverse=True):
         result = _fetch_resolution(slug)
-        # Simulated fills: assume all ladder rungs filled (paper-mode optimism;
-        # real fills depend on whether the market traded through each price).
         staked = r.get("total_usdc", 0.0)
         total_staked += staked
+
+        # Realistic fill simulation (only for resolved markets)
+        real_pl = 0.0
+        real_stake = 0.0
+        real_fillable = None
+        if result in ("UP", "DOWN"):
+            mkt = _fetch_market_trades(slug)
+            won = (side == "YES" and result == "UP") or (side == "NO" and result == "DOWN")
+            our_token = mkt["yes_token"] if side == "YES" else mkt["no_token"]
+            try:
+                round_start = int(slug.split("-")[-1])
+            except (ValueError, IndexError):
+                round_start = 0
+            round_end = round_start + 300
+            if our_token and round_start:
+                shares_we_get, breakdown = _simulate_fills(
+                    r["levels"], our_token, mkt["trades"], round_start, round_end,
+                )
+                real_stake = sum(b["usdc"] for b in breakdown if b["filled"])
+                real_pl = shares_we_get * (1.0 if won else 0.0) - real_stake
+                real_fillable = sum(1 for b in breakdown if b["filled"])
+                tot_pl_real += real_pl
+                tot_staked_real += real_stake
+
         if result in ("UP", "DOWN"):
             won = (side == "YES" and result == "UP") or (side == "NO" and result == "DOWN")
             payoff = 0.0
             for price, usdc in r["levels"]:
                 shares = usdc / price
                 payoff += shares * (1.0 if won else 0.0)
-            # Maker rebate ≈ 0 fee for simplicity (real makers pay 0 + rebate)
             pl = payoff - staked
             status = "WIN" if won else "LOSS"
             if won: wins += 1
@@ -290,6 +405,8 @@ def _compute_ladder_backtest() -> dict:
             "sec_left": r.get("sec_left"), "opening": r.get("opening"),
             "current_at_signal": r.get("current"), "total_usdc": staked,
             "result": status, "pl": pl,
+            "real_pl": real_pl, "real_stake": real_stake,
+            "real_fillable_rungs": real_fillable,
         })
 
     out = {
@@ -298,6 +415,7 @@ def _compute_ladder_backtest() -> dict:
         "wins": wins, "losses": losses, "pending": pending,
         "win_rate": (wins / (wins + losses)) if (wins + losses) else None,
         "total_pl": tot_pl, "total_staked": total_staked,
+        "total_pl_real": tot_pl_real, "total_staked_real": tot_staked_real,
         "picks": picks[:50],
     }
     _ladder_cache = (time.time(), out)
@@ -552,7 +670,7 @@ tr:hover td { background:#192029; }
     a fraction of this. Use as a relative comparison, not an absolute.
   </div>
   <table id="ladder_tbl"><thead>
-    <tr><th>Time</th><th>Asset</th><th>Side</th><th>z</th><th>Move</th><th>Sec left</th><th>Open</th><th>Current</th><th>Stake</th><th>Result</th><th>P&amp;L</th><th>Slug</th></tr>
+    <tr><th>Time</th><th>Asset</th><th>Side</th><th>z</th><th>Move</th><th>Open</th><th>Current</th><th>Stake</th><th>Result</th><th>Optimistic P&amp;L</th><th>Real Stake</th><th>Real P&amp;L</th><th>Filled</th><th>Slug</th></tr>
   </thead><tbody></tbody></table>
   <div id="ladder_empty" class="mut" style="padding:12px 4px; display:none">No ladder signals yet. Fires when |z| ≥ 2 at T-90s to T-45s.</div>
 </div>
@@ -719,8 +837,12 @@ async function refresh() {
       const wr = ladder.win_rate==null ? "—" : (ladder.win_rate*100).toFixed(1)+"%";
       const plS = (ladder.total_pl>=0?"+":"") + "$" + (ladder.total_pl||0).toFixed(2);
       const plCls = ladder.total_pl>0?"ok":ladder.total_pl<0?"bad":"mut";
+      const realPl = ladder.total_pl_real || 0;
+      const realPlS = (realPl>=0?"+":"") + "$" + realPl.toFixed(2);
+      const realPlCls = realPl>0?"ok":realPl<0?"bad":"mut";
+      const realStake = ladder.total_staked_real || 0;
       document.getElementById("ladder_summary").innerHTML =
-        `<span class="${plCls}">${plS}</span> · ${wr} win rate · ${ladder.wins||0}W/${ladder.losses||0}L/${ladder.pending||0}P · staked $${(ladder.total_staked||0).toFixed(2)}`;
+        `Optimistic <span class="${plCls}">${plS}</span> · Realistic <span class="${realPlCls}">${realPlS}</span> (real stake $${realStake.toFixed(2)}) · ${wr} win rate · ${ladder.wins||0}W/${ladder.losses||0}L/${ladder.pending||0}P`;
       document.getElementById("ladder_empty").style.display = lpicks.length ? "none" : "block";
       for (const p of lpicks) {
         const t = new Date(p.ts*1000).toLocaleTimeString();
@@ -731,16 +853,21 @@ async function refresh() {
         const moveCls = p.move_bps==null ? "mut" : (p.move_bps>0 ? "ok" : "bad");
         const moveStr = p.move_bps==null ? "—" : `${p.move_bps>=0?"+":""}${p.move_bps.toFixed(1)} bps`;
         const tr = document.createElement("tr");
+        const realPlS = (p.real_pl>=0?"+":"") + "$" + (p.real_pl||0).toFixed(2);
+        const realPlCls = p.real_pl>0?"ok":p.real_pl<0?"bad":"mut";
+        const filledStr = p.real_fillable_rungs==null ? "—" : `${p.real_fillable_rungs}/3`;
         tr.innerHTML = `<td class="mut">${t}</td><td>${p.asset}</td>
           <td class="${sideCls}">${sideArrow}</td>
           <td>${p.z_score==null?"—":p.z_score.toFixed(2)}</td>
           <td class="${moveCls}">${moveStr}</td>
-          <td>${p.sec_left==null?"—":Math.round(p.sec_left)+"s"}</td>
           <td>${fmtPx(p.opening, p.asset)}</td>
           <td>${fmtPx(p.current_at_signal, p.asset)}</td>
           <td>$${(p.total_usdc||0).toFixed(2)}</td>
           <td><span class="pill ${p.result}">${p.result}</span></td>
           <td class="${plCls2}">${plS2}</td>
+          <td>$${(p.real_stake||0).toFixed(2)}</td>
+          <td class="${realPlCls}">${realPlS}</td>
+          <td>${filledStr}</td>
           <td class="mut">${p.slug}</td>`;
         ladderBody.appendChild(tr);
       }
