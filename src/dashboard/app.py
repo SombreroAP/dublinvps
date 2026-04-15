@@ -36,6 +36,8 @@ _chainlink = ChainlinkFeed()
 _started = time.time()
 _resolution_cache: dict[str, tuple[float, str]] = {}  # slug -> (fetched_at, result)
 _backtest_cache: tuple[float, dict] | None = None
+# Live ask cache: (slug, side) -> (fetched_at, ask). ttl 2s.
+_live_ask_cache: dict[tuple[str, str], tuple[float, float | None]] = {}
 
 
 def _check_auth(creds: HTTPBasicCredentials = Depends(security)) -> None:
@@ -65,6 +67,41 @@ def _read_signals() -> list[dict]:
             except json.JSONDecodeError:
                 continue
     return out
+
+
+def _fetch_live_ask(slug: str, side: str) -> float | None:
+    """Return current CLOB best-ask for (slug, side). ttl 2s."""
+    key = (slug, side)
+    now = time.time()
+    hit = _live_ask_cache.get(key)
+    if hit and now - hit[0] < 2:
+        return hit[1]
+    try:
+        raw = subprocess.check_output([
+            "curl", "-s", "-H", "User-Agent: Mozilla/5.0",
+            f"https://gamma-api.polymarket.com/events?slug={slug}",
+        ], timeout=5)
+        d = json.loads(raw)
+        if not d:
+            _live_ask_cache[key] = (now, None)
+            return None
+        m = d[0].get("markets", [{}])[0]
+        tokens = json.loads(m.get("clobTokenIds") or "[]")
+        if len(tokens) != 2:
+            _live_ask_cache[key] = (now, None)
+            return None
+        tid = tokens[0] if side == "YES" else tokens[1]
+        raw = subprocess.check_output([
+            "curl", "-s",
+            f"https://clob.polymarket.com/book?token_id={tid}",
+        ], timeout=4)
+        b = json.loads(raw)
+        asks = b.get("asks") or []
+        best_ask = min((float(x["price"]) for x in asks), default=None)
+    except Exception:
+        best_ask = None
+    _live_ask_cache[key] = (now, best_ask)
+    return best_ask
 
 
 def _fetch_resolution(slug: str) -> str:
@@ -135,6 +172,9 @@ def _compute_backtest() -> dict:
         live = _chainlink.last_price.get(r["asset"])
         open_px = r.get("opening")
         delta = (live - open_px) if (live is not None and open_px is not None) else None
+        # Live ask only makes sense for open markets (and we don't want to hammer
+        # CLOB for resolved ones).
+        live_ask = _fetch_live_ask(slug, side) if status_ == "open" else None
         # Is live trending toward winning? (only meaningful while open)
         if delta is None:
             trending = None
@@ -146,7 +186,7 @@ def _compute_backtest() -> dict:
             "ask": r["ask"], "fair_p": r["fair_p"], "edge": r["edge"],
             "fee": r["fee"], "size_usdc": r["size_usdc"],
             "opening": open_px, "live": live, "delta": delta,
-            "trending": trending,
+            "live_ask": live_ask, "trending": trending,
             "result": status_, "pl": pl,
         })
 
@@ -245,7 +285,7 @@ tr:hover td { background:#192029; }
 <div class="card" style="margin:0 16px 16px">
   <h2>Recent picks (best per market, most recent first)</h2>
   <table id="picks_tbl"><thead>
-    <tr><th>Time</th><th>Asset</th><th>Target</th><th>Ask</th><th>Fair p</th><th>Edge</th><th>Size</th><th>Open</th><th>Live</th><th>Δ</th><th>Result</th><th>P&amp;L</th><th>Slug</th></tr>
+    <tr><th>Time</th><th>Asset</th><th>Target</th><th>Ask</th><th>Live ask</th><th>Fair p</th><th>Edge</th><th>Size</th><th>Open</th><th>Live</th><th>Δ</th><th>Result</th><th>P&amp;L</th><th>Slug</th></tr>
   </thead><tbody></tbody></table>
 </div>
 </div>
@@ -300,9 +340,19 @@ async function refresh() {
         deltaCell = `${sign}${deltaFmt}`;
         deltaCls = p.trending ? "ok" : "bad";
       }
+      // Live ask: show only for open; color vs entry ask (lower = market moved
+      // in our direction; higher = against).
+      let liveAskCell = "—", liveAskCls = "mut";
+      if (p.live_ask != null && p.result === "open") {
+        liveAskCell = p.live_ask.toFixed(2);
+        if (p.live_ask < p.ask) liveAskCls = "ok";      // cheaper than entry = good
+        else if (p.live_ask > p.ask) liveAskCls = "bad"; // more expensive = against
+      }
       tr.innerHTML = `<td class="mut">${t}</td><td>${p.asset}</td>
         <td class="${tgtCls}">${tgtArrow} ${p.target}</td>
-        <td>${p.ask.toFixed(2)}</td><td>${p.fair_p.toFixed(2)}</td>
+        <td>${p.ask.toFixed(2)}</td>
+        <td class="${liveAskCls}">${liveAskCell}</td>
+        <td>${p.fair_p.toFixed(2)}</td>
         <td>${(p.edge*100).toFixed(1)}%</td>
         <td>$${p.size_usdc.toFixed(0)}</td>
         <td>${fmtPx(p.opening, p.asset)}</td>
