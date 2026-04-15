@@ -293,13 +293,12 @@ async function refresh() {
       const tgtCls = p.target==="UP" ? "ok" : "bad";
       const tgtArrow = p.target==="UP" ? "↑" : "↓";
       let deltaCell = "—", deltaCls = "mut";
-      if (p.delta != null) {
+      // Only show Δ for OPEN positions — for resolved, post-round drift is misleading.
+      if (p.delta != null && p.result === "open") {
         const sign = p.delta>=0 ? "+" : "";
         const deltaFmt = p.asset==="SOL" ? p.delta.toFixed(3) : p.delta.toFixed(2);
         deltaCell = `${sign}${deltaFmt}`;
-        // color by trending (only visible distinction when open; for resolved it's just informational)
-        if (p.result==="open") deltaCls = p.trending ? "ok" : "bad";
-        else deltaCls = p.trending ? "mut" : "mut";
+        deltaCls = p.trending ? "ok" : "bad";
       }
       tr.innerHTML = `<td class="mut">${t}</td><td>${p.asset}</td>
         <td class="${tgtCls}">${tgtArrow} ${p.target}</td>
