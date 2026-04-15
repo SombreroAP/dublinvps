@@ -26,7 +26,8 @@ from src.feeds.chainlink import ChainlinkFeed
 from src.polymarket.gamma import fetch_active_markets
 
 PAPER_LOG = Path("/opt/sniper/paper_trades.jsonl")
-SHADOW_LOG = Path("/opt/sniper/paper_trades_shadow.jsonl")
+SHADOW_DIR = Path("/opt/sniper")  # paper_trades_shadow_<label>.jsonl files
+LEGACY_SHADOW_LOG = Path("/opt/sniper/paper_trades_shadow.jsonl")  # pre-multi-wallet
 CHAINLINK_CUTOFF = 1776250620  # systemd go-live; edit as needed
 
 DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD") or ""
@@ -494,27 +495,16 @@ def _compute_live_state() -> list[dict]:
     return out
 
 
-def _compute_shadow_backtest() -> dict:
-    """Mirror Dimpled-Dill's trades. Each shadow signal is an attempt to copy
-    one of his BUY fills. Use the realistic fill simulator to estimate how
-    many of those we'd actually get (since we're 5-10s late + queue position).
-    """
-    global _shadow_cache
-    if _shadow_cache and time.time() - _shadow_cache[0] < 5:
-        return _shadow_cache[1]
-
+def _compute_one_wallet_shadow(label: str, log_path: Path) -> dict:
+    """Backtest one shadow log file. Returns per-wallet stats + picks."""
     rows: list[dict] = []
-    if SHADOW_LOG.exists():
-        with SHADOW_LOG.open() as f:
+    if log_path.exists():
+        with log_path.open() as f:
             for line in f:
                 try:
                     rows.append(json.loads(line))
                 except json.JSONDecodeError:
                     continue
-
-    # Group all shadow trades by (slug, side) — DD might fire multiple bids
-    # at different prices on the same market; we want each bid as a separate
-    # rung in our paper position.
     by_key: dict[tuple[str, str], list[dict]] = {}
     for r in rows:
         k = (r["slug"], r["side"])
@@ -524,21 +514,20 @@ def _compute_shadow_backtest() -> dict:
     tot_pl_real = 0.0
     tot_staked_real = 0.0
     wins = losses = pending = 0
-    dd_total_usdc = 0.0
+    leader_total_usdc = 0.0
     for (slug, side), trades_list in sorted(
             by_key.items(), key=lambda kv: kv[1][0]["ts"], reverse=True):
         result = _fetch_resolution(slug)
-        # Build "ladder" from DD's actual fills on this side (price, usdc).
         rungs = [(t["dd_price"], t["dd_usdc"]) for t in trades_list
                  if t.get("dd_price", 0) > 0 and t.get("dd_usdc", 0) > 0]
-        dd_stake = sum(u for _, u in rungs)
-        dd_total_usdc += dd_stake
+        leader_stake = sum(u for _, u in rungs)
+        leader_total_usdc += leader_stake
 
         if result not in ("UP", "DOWN"):
             picks.append({
                 "ts": trades_list[0]["ts"], "slug": slug,
                 "asset": trades_list[0]["asset"], "side": side,
-                "dd_stake": dd_stake, "real_stake": 0.0, "real_pl": 0.0,
+                "leader_stake": leader_stake, "real_stake": 0.0, "real_pl": 0.0,
                 "result": result, "fills_count": 0, "rungs_count": len(rungs),
             })
             pending += 1
@@ -554,10 +543,6 @@ def _compute_shadow_backtest() -> dict:
             round_start = 0
         round_end = round_start + 300
 
-        # Use simulator to determine which of DD's bid prices would have
-        # filled FOR US (we're 5-10s behind). The simulator counts ANY trade
-        # at-or-below our price, so it's still optimistic but honest about
-        # the price-trade-through condition.
         shares_we_get, breakdown = _simulate_fills(
             rungs, our_token, mkt["trades"], round_start, round_end,
         )
@@ -574,20 +559,53 @@ def _compute_shadow_backtest() -> dict:
         picks.append({
             "ts": trades_list[0]["ts"], "slug": slug,
             "asset": trades_list[0]["asset"], "side": side,
-            "dd_stake": dd_stake, "real_stake": real_stake, "real_pl": real_pl,
+            "leader_stake": leader_stake, "real_stake": real_stake,
+            "real_pl": real_pl,
             "result": "WIN" if won else "LOSS",
             "fills_count": fills_count, "rungs_count": len(rungs),
         })
 
-    out = {
+    return {
+        "label": label,
         "total_signals": len(rows),
         "unique_picks": len(by_key),
         "wins": wins, "losses": losses, "pending": pending,
         "win_rate": (wins / (wins + losses)) if (wins + losses) else None,
         "total_pl_real": tot_pl_real,
         "total_staked_real": tot_staked_real,
-        "dd_total_usdc": dd_total_usdc,
-        "picks": picks[:50],
+        "leader_total_usdc": leader_total_usdc,
+        "picks": picks[:30],
+    }
+
+
+def _compute_shadow_backtest() -> dict:
+    """Multi-wallet: read all paper_trades_shadow_<label>.jsonl files plus the
+    legacy single-file log, compute per-wallet backtest, return aggregate."""
+    global _shadow_cache
+    if _shadow_cache and time.time() - _shadow_cache[0] < 5:
+        return _shadow_cache[1]
+
+    wallets = []
+    # Discover per-wallet log files
+    for path in sorted(SHADOW_DIR.glob("paper_trades_shadow_*.jsonl")):
+        label = path.stem.replace("paper_trades_shadow_", "")
+        wallets.append(_compute_one_wallet_shadow(label, path))
+    # Include legacy single-file log if present and non-empty
+    if LEGACY_SHADOW_LOG.exists() and LEGACY_SHADOW_LOG.stat().st_size > 0:
+        wallets.append(_compute_one_wallet_shadow("dd_legacy", LEGACY_SHADOW_LOG))
+
+    out = {
+        "wallets": wallets,
+        "aggregate": {
+            "total_signals":     sum(w["total_signals"] for w in wallets),
+            "unique_picks":      sum(w["unique_picks"] for w in wallets),
+            "wins":              sum(w["wins"] for w in wallets),
+            "losses":            sum(w["losses"] for w in wallets),
+            "pending":           sum(w["pending"] for w in wallets),
+            "total_pl_real":     sum(w["total_pl_real"] for w in wallets),
+            "total_staked_real": sum(w["total_staked_real"] for w in wallets),
+            "leader_total_usdc": sum(w["leader_total_usdc"] for w in wallets),
+        },
     }
     _shadow_cache = (time.time(), out)
     return out
@@ -697,18 +715,15 @@ tr:hover td { background:#192029; }
 </div>
 
 <div class="card" style="margin:0 16px 16px; border-color:#1a4a4a">
-  <h2 style="color:#39c5bb">👁 Shadow bot (mirror Dimpled-Dill)
-    <span id="shadow_summary" class="mut" style="font-weight:400; margin-left:8px"></span>
+  <h2 style="color:#39c5bb">👁 Shadow bots (multi-wallet)
+    <span id="shadow_aggregate" class="mut" style="font-weight:400; margin-left:8px"></span>
   </h2>
   <div class="mut" style="font-size:11px; padding:2px 0 8px">
-    Polls DD's activity API every 5s. Each new BUY of his is mirrored as a
-    paper bid at the same price/size. Realistic P&amp;L uses fill simulator
-    (we're 5-10s behind him + queue position behind his orders).
+    Mirrors trades from multiple Polymarket wallets in parallel. Each wallet's
+    P&amp;L tracked separately so we can identify which strategy is currently
+    profitable. Realistic fill simulator applied to all picks.
   </div>
-  <table id="shadow_tbl"><thead>
-    <tr><th>Time</th><th>Asset</th><th>Side</th><th>DD stake</th><th>Rungs</th><th>Filled</th><th>Real stake</th><th>Result</th><th>Real P&amp;L</th><th>Slug</th></tr>
-  </thead><tbody></tbody></table>
-  <div id="shadow_empty" class="mut" style="padding:12px 4px; display:none">No shadow signals yet. Wait for DD to fire a trade.</div>
+  <div id="shadow_wallets"></div>
 </div>
 
 <div class="card" style="margin:0 16px 16px">
@@ -878,39 +893,67 @@ async function refresh() {
       pendingBody.appendChild(tr);
     }
 
-    // Shadow bot rendering
+    // Multi-wallet shadow rendering
     const shadow = d.shadow || {};
-    const shadowBody = document.querySelector("#shadow_tbl tbody");
-    if (shadowBody) {
-      shadowBody.innerHTML = "";
-      const sp = shadow.picks || [];
-      const swr = shadow.win_rate==null ? "—" : (shadow.win_rate*100).toFixed(1)+"%";
-      const spl = shadow.total_pl_real || 0;
-      const splS = (spl>=0?"+":"") + "$" + spl.toFixed(2);
-      const splCls = spl>0?"ok":spl<0?"bad":"mut";
-      const sstk = shadow.total_staked_real || 0;
-      const ddstk = shadow.dd_total_usdc || 0;
-      document.getElementById("shadow_summary").innerHTML =
-        `<span class="${splCls}">${splS}</span> · ${swr} win rate · ${shadow.wins||0}W/${shadow.losses||0}L/${shadow.pending||0}P · we staked $${sstk.toFixed(2)} of DD's $${ddstk.toFixed(2)}`;
-      document.getElementById("shadow_empty").style.display = sp.length ? "none" : "block";
-      for (const p of sp) {
-        const t = new Date(p.ts*1000).toLocaleTimeString();
-        const sideCls = p.side==="YES" ? "ok" : "bad";
-        const sideArrow = p.side==="YES" ? "↑ UP" : "↓ DOWN";
-        const splS2 = (p.real_pl>=0?"+":"") + "$" + p.real_pl.toFixed(2);
-        const splCls2 = p.real_pl>0?"ok":p.real_pl<0?"bad":"mut";
-        const fillStr = p.rungs_count ? `${p.fills_count}/${p.rungs_count}` : "—";
-        const tr = document.createElement("tr");
-        tr.innerHTML = `<td class="mut">${t}</td><td>${p.asset}</td>
-          <td class="${sideCls}">${sideArrow}</td>
-          <td>$${(p.dd_stake||0).toFixed(2)}</td>
-          <td>${p.rungs_count}</td>
-          <td>${fillStr}</td>
-          <td>$${(p.real_stake||0).toFixed(2)}</td>
-          <td><span class="pill ${p.result}">${p.result}</span></td>
-          <td class="${splCls2}">${splS2}</td>
-          <td class="mut">${p.slug}</td>`;
-        shadowBody.appendChild(tr);
+    const agg = shadow.aggregate || {};
+    const wallets = shadow.wallets || [];
+    const aggPl = agg.total_pl_real || 0;
+    const aggPlS = (aggPl>=0?"+":"") + "$" + aggPl.toFixed(2);
+    const aggPlCls = aggPl>0?"ok":aggPl<0?"bad":"mut";
+    const aggWR = (agg.wins+agg.losses)
+      ? `${(agg.wins/(agg.wins+agg.losses)*100).toFixed(1)}%`
+      : "—";
+    document.getElementById("shadow_aggregate").innerHTML =
+      `aggregate <span class="${aggPlCls}">${aggPlS}</span> · ${aggWR} win rate · ${agg.wins||0}W/${agg.losses||0}L/${agg.pending||0}P across ${wallets.length} wallet(s)`;
+
+    const container = document.getElementById("shadow_wallets");
+    if (container) {
+      container.innerHTML = "";
+      for (const w of wallets) {
+        const wPl = w.total_pl_real || 0;
+        const wPlS = (wPl>=0?"+":"") + "$" + wPl.toFixed(2);
+        const wPlCls = wPl>0?"ok":wPl<0?"bad":"mut";
+        const wWR = w.win_rate==null ? "—" : (w.win_rate*100).toFixed(1)+"%";
+        const sec = document.createElement("div");
+        sec.style.cssText = "margin-top:14px; padding-top:10px; border-top:1px dashed #1f2730";
+        sec.innerHTML = `
+          <h3 style="margin:0 0 8px; font-size:13px">
+            <span style="color:#39c5bb">●</span> ${w.label}
+            <span class="mut" style="font-weight:400; margin-left:8px; font-size:11px">
+              <span class="${wPlCls}">${wPlS}</span> · ${wWR} · ${w.wins||0}W/${w.losses||0}L/${w.pending||0}P · we staked $${(w.total_staked_real||0).toFixed(2)} of leader's $${(w.leader_total_usdc||0).toFixed(2)}
+            </span>
+          </h3>
+          <table style="width:100%"><thead>
+            <tr><th>Time</th><th>Asset</th><th>Side</th><th>Leader $</th><th>Rungs</th><th>Filled</th><th>Real $</th><th>Result</th><th>Real P&amp;L</th><th>Slug</th></tr>
+          </thead><tbody></tbody></table>
+        `;
+        const tbody = sec.querySelector("tbody");
+        const sp = w.picks || [];
+        if (!sp.length) {
+          const tr = document.createElement("tr");
+          tr.innerHTML = `<td colspan="10" class="mut" style="padding:8px 4px">No signals yet from this wallet.</td>`;
+          tbody.appendChild(tr);
+        }
+        for (const p of sp) {
+          const t = new Date(p.ts*1000).toLocaleTimeString();
+          const sideCls = p.side==="YES" ? "ok" : "bad";
+          const sideArrow = p.side==="YES" ? "↑ UP" : "↓ DOWN";
+          const splS = (p.real_pl>=0?"+":"") + "$" + p.real_pl.toFixed(2);
+          const splCls = p.real_pl>0?"ok":p.real_pl<0?"bad":"mut";
+          const fillStr = p.rungs_count ? `${p.fills_count}/${p.rungs_count}` : "—";
+          const tr = document.createElement("tr");
+          tr.innerHTML = `<td class="mut">${t}</td><td>${p.asset}</td>
+            <td class="${sideCls}">${sideArrow}</td>
+            <td>$${(p.leader_stake||0).toFixed(2)}</td>
+            <td>${p.rungs_count}</td>
+            <td>${fillStr}</td>
+            <td>$${(p.real_stake||0).toFixed(2)}</td>
+            <td><span class="pill ${p.result}">${p.result}</span></td>
+            <td class="${splCls}">${splS}</td>
+            <td class="mut">${p.slug}</td>`;
+          tbody.appendChild(tr);
+        }
+        container.appendChild(sec);
       }
     }
 
