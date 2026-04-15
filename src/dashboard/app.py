@@ -297,7 +297,7 @@ def _fetch_market_trades(slug: str) -> dict:
 
         # Fetch trades for this conditionId. Paginate by offset.
         all_trades: list[dict] = []
-        for offset in (0, 500, 1000):
+        for offset in (0, 500, 1000, 1500, 2000, 2500):
             try:
                 raw = subprocess.check_output([
                     "curl", "-s", "-H", "User-Agent: Mozilla/5.0",
@@ -332,11 +332,15 @@ def _simulate_fills(rungs: list, winning_token: str, trades: list[dict],
 
     Returns (total_winning_shares, [{price, usdc, filled, fill_reason}, ...]).
     """
+    # Window: from order-placement (round start) through the post-round
+    # convergence trading. Polymarket markets keep trading after round_end
+    # while the orderbook converges to the resolved $1/$0 prices — that's
+    # where the deepest fills happen for ladder strategies.
     in_window = [
         (float(t["price"]), float(t["size"]), int(t["timestamp"]))
         for t in trades
         if str(t.get("asset", "")) == winning_token
-        and round_start - 5 <= int(t.get("timestamp", 0)) <= round_end + 30
+        and round_start - 5 <= int(t.get("timestamp", 0)) <= round_end + 600
     ]
     breakdown = []
     total_shares = 0.0
