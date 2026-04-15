@@ -7,3 +7,5 @@ python-dotenv>=1.0.0
 structlog>=24.1.0
 orjson>=3.10.0
 tenacity>=8.2.0
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0

@@ -1,0 +1,26 @@
+[Unit]
+Description=Polymarket Sniper Dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sniper
+Group=sniper
+WorkingDirectory=/opt/sniper
+EnvironmentFile=/opt/sniper/.env
+ExecStart=/opt/sniper/.venv/bin/python -m src.dashboard.app
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sniper-dash
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadOnlyPaths=/opt/sniper
+
+[Install]
+WantedBy=multi-user.target
