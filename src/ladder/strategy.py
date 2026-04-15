@@ -21,12 +21,16 @@ from src.config import settings
 from src.polymarket.gamma import Market
 
 
-# Tunables. Start conservative; we'll calibrate from paper data.
-Z_THRESHOLD = 2.0          # only ladder when move ≥ 2σ extreme
-WINDOW_START_SEC = 90       # look at markets from T-90s
-WINDOW_END_SEC = 45         # stop placing new ladders at T-45s (last-minute is expensive)
+# Tunables.
+# MODE controls which strategy variant runs:
+#   "fade"  — original: only ladder OPPOSITE side when |z| >= Z_THRESHOLD
+#   "both"  — pure-mechanics test: ladder BOTH sides on every round
+MODE = "both"
+Z_THRESHOLD = 2.0
+WINDOW_START_SEC = 280      # for "both": fire near round-open (T-280s = 20s in)
+WINDOW_END_SEC = 60          # stop firing in last minute (no time for fills)
 LADDER_LEVELS = [
-    # (price, usdc_size)  — rough mirror of Dimpled-Dill's sizing
+    # (price, usdc_size) — Dimpled-Dill's typical ladder
     (0.03, 1.00),
     (0.02, 2.00),
     (0.01, 5.00),
@@ -58,31 +62,37 @@ class LadderSignal:
         return sum(usdc for _, usdc in self.levels)
 
 
-def evaluate(market: Market, current: float, opening: float) -> LadderSignal | None:
-    """Return LadderSignal if conditions met, else None."""
+def evaluate(market: Market, current: float, opening: float) -> list[LadderSignal]:
+    """Return zero or more LadderSignals based on MODE."""
     sec_left = market.seconds_remaining
     if not (WINDOW_END_SEC <= sec_left <= WINDOW_START_SEC):
-        return None
+        return []
     if opening is None or current is None or opening <= 0:
-        return None
+        return []
     move_bps = (current - opening) / opening * 10_000
     sigma = _sigma_bps(market.asset)
     sd = sigma * sqrt(max(sec_left, 1))
-    if sd < 1e-9:
-        return None
-    z = move_bps / sd
-    if abs(z) < Z_THRESHOLD:
-        return None
-    # Fade: bet the OPPOSITE of the move direction.
-    # If move is positive (price up), fade = bet DOWN → buy NO
-    # If move is negative (price down), fade = bet UP → buy YES
-    side = "NO" if z > 0 else "YES"
-    return LadderSignal(
-        slug=market.slug, asset=market.asset, side=side,
-        z_score=z, move_bps=move_bps, sec_left=sec_left,
-        opening=opening, current=current,
-        levels=list(LADDER_LEVELS),
-    )
+    z = move_bps / sd if sd > 1e-9 else 0.0
+
+    sides: list[str]
+    if MODE == "both":
+        sides = ["YES", "NO"]
+    elif MODE == "fade":
+        if abs(z) < Z_THRESHOLD:
+            return []
+        sides = ["NO" if z > 0 else "YES"]
+    else:
+        return []
+
+    return [
+        LadderSignal(
+            slug=market.slug, asset=market.asset, side=side,
+            z_score=z, move_bps=move_bps, sec_left=sec_left,
+            opening=opening, current=current,
+            levels=list(LADDER_LEVELS),
+        )
+        for side in sides
+    ]
 
 
 def signal_to_dict(sig: LadderSignal) -> dict:

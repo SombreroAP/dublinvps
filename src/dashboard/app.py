@@ -522,9 +522,14 @@ tr:hover td { background:#192029; }
 </div>
 
 <div class="card" style="margin:0 16px 16px; border-color:#3a2d4a">
-  <h2 style="color:#a371f7">🪜 Ladder bot (fade strategy)
+  <h2 style="color:#a371f7">🪜 Ladder bot (both-sides spam test)
     <span id="ladder_summary" class="mut" style="font-weight:400; margin-left:8px"></span>
   </h2>
+  <div class="mut" style="font-size:11px; padding:2px 0 8px">
+    ⚠ Paper P&amp;L assumes ALL ladder rungs fill at posted prices. In reality
+    only rungs the market trades through actually fill, so real P&amp;L will be
+    a fraction of this. Use as a relative comparison, not an absolute.
+  </div>
   <table id="ladder_tbl"><thead>
     <tr><th>Time</th><th>Asset</th><th>Side</th><th>z</th><th>Move</th><th>Sec left</th><th>Open</th><th>Current</th><th>Stake</th><th>Result</th><th>P&amp;L</th><th>Slug</th></tr>
   </thead><tbody></tbody></table>

@@ -67,16 +67,15 @@ async def main() -> None:
                         opn = openings_.get(m.slug)
                         if cur is None or opn is None:
                             continue
-                        sig = evaluate(m, cur, opn)
-                        if sig is None:
-                            continue
-                        key = (sig.slug, sig.side)
-                        if key in fired:
-                            continue
-                        fired.add(key)
-                        d = signal_to_dict(sig)
-                        PAPER_LOG.open("ab").write(orjson.dumps(d) + b"\n")
-                        log.info("ladder.signal", **d)
+                        sigs = evaluate(m, cur, opn)
+                        for sig in sigs:
+                            key = (sig.slug, sig.side)
+                            if key in fired:
+                                continue
+                            fired.add(key)
+                            d = signal_to_dict(sig)
+                            PAPER_LOG.open("ab").write(orjson.dumps(d) + b"\n")
+                            log.info("ladder.signal", **d)
                     if now - last_status > 30:
                         log.info("ladder.heartbeat", markets=len(markets),
                                  openings=len(openings_), fired=len(fired))
