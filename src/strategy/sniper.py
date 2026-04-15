@@ -114,6 +114,16 @@ async def evaluate_and_log(
     fill_ask, fillable = sweep_fill_ask(asks, desired_size)
     if fill_ask is None or fillable < 5.0:  # dust book
         return
+    # Reality filters — prevent logging signals that couldn't be filled:
+    #   1. Ask below $0.05: typically a handful of dust shares; real queue
+    #      behind them means we'd never hit this price at meaningful size.
+    #   2. Claimed edge > 30%: if the market is ACTUALLY pricing 30pp below
+    #      our fair_p, we are wrong, not the market. Likely stale data.
+    #   3. Require at least 80% of desired size fillable.
+    if fill_ask < 0.05:
+        return
+    if fillable < 0.8 * desired_size:
+        return
     # Market's implied probability for OUR side. Use mid if we have both,
     # else fall back to best_ask.
     market_implied = ((best_bid + best_ask) / 2) if (best_bid is not None) else best_ask
@@ -124,6 +134,10 @@ async def evaluate_and_log(
     fee = market.taker_fee_at(fill_ask)
     edge = target_p - fill_ask - fee
     if edge <= settings.edge_threshold:
+        return
+    # Hard cap: edge > 30% almost certainly means stale data or a model bug,
+    # not real alpha. Markets don't leave 30pp on the table for seconds.
+    if edge > 0.30:
         return
 
     key = (market.slug, side)
