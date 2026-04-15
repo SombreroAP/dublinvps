@@ -4,13 +4,9 @@ Subscribes to wss://ws-live-data.polymarket.com → topic `crypto_prices_chainli
 This is the EXACT signed price Polymarket's resolver uses for 5m/15m crypto
 markets, so it eliminates the basis risk of using Binance as a proxy.
 
-Schema (reverse-engineered, see docs/polymarket-api-research.md):
-  Subscribe:  {"action":"subscribe",
-               "subscriptions":[{"topic":"crypto_prices_chainlink",
-                                  "type":"*","filters":""}]}
-  Update:     {"topic":"crypto_prices_chainlink","type":"update",
-               "timestamp":<ms>,
-               "payload":{"symbol":"btc/usd","timestamp":<ms>,"value":<float>}}
+Protocol requires app-level PING every ~5s. Without it, the server stops
+pushing updates while leaving the TCP alive (silent staleness). We also run
+a watchdog that force-reconnects if no update arrives for STALENESS_LIMIT.
 """
 from __future__ import annotations
 
@@ -34,31 +30,25 @@ SUBSCRIBE: Final = {
         {"topic": "crypto_prices_chainlink", "type": "*", "filters": ""}
     ],
 }
+PING_INTERVAL_SEC: Final = 5.0
+STALENESS_LIMIT_SEC: Final = 30.0
+
+
+class _StalenessError(Exception):
+    """Raised by watchdog to force reconnect via tenacity."""
 
 
 class ChainlinkFeed:
-    """Streams Chainlink prices and serves opening-price queries.
-
-    `last_price[asset]`        : most recent value (matches Polymarket's resolver).
-    `opening_at(asset, ts)`    : Chainlink value at-or-just-after the given round
-                                  start unix-second timestamp; None if not yet seen.
-    """
-
     def __init__(self) -> None:
         self.last_price: dict[str, float] = {}
         self.last_ts_ms: dict[str, int] = {}
-        # Per-asset rolling history of (ts_ms, value) — last few minutes.
+        self._last_msg_mono: float = 0.0  # monotonic clock of last received message
         self._history: dict[str, deque[tuple[int, float]]] = {
             a: deque(maxlen=2000) for a in SYMBOL_TO_ASSET.values()
         }
-        # Cache of resolved openings: (asset, round_start_sec) -> value
         self._openings: dict[tuple[str, int], float] = {}
 
     def opening_at(self, asset: str, round_start_sec: int) -> float | None:
-        """Return Chainlink value at-or-just-after round_start_sec for asset.
-        Polymarket's resolver picks the first observation with ts >= boundary,
-        so we mirror that.
-        """
         key = (asset, round_start_sec)
         cached = self._openings.get(key)
         if cached is not None:
@@ -70,30 +60,79 @@ class ChainlinkFeed:
                 return val
         return None
 
+    async def _pinger(self, ws: "websockets.WebSocketClientProtocol") -> None:
+        while True:
+            await asyncio.sleep(PING_INTERVAL_SEC)
+            try:
+                await ws.send("PING")
+            except websockets.ConnectionClosed:
+                return
+
+    async def _watchdog(self) -> None:
+        """Force reconnect if we haven't seen a message in STALENESS_LIMIT_SEC."""
+        while True:
+            await asyncio.sleep(5.0)
+            if self._last_msg_mono and (time.monotonic() - self._last_msg_mono) > STALENESS_LIMIT_SEC:
+                log.error("chainlink.stale_reconnect",
+                          stale_for_sec=time.monotonic() - self._last_msg_mono)
+                raise _StalenessError()
+
+    async def _receiver(self, ws: "websockets.WebSocketClientProtocol") -> None:
+        async for raw in ws:
+            if isinstance(raw, bytes):
+                continue
+            if raw == "PONG":
+                self._last_msg_mono = time.monotonic()
+                continue
+            try:
+                msg = orjson.loads(raw)
+            except (ValueError, TypeError):
+                continue
+            if msg.get("topic") != "crypto_prices_chainlink":
+                self._last_msg_mono = time.monotonic()
+                continue
+            payload = msg.get("payload") or {}
+            sym = (payload.get("symbol") or "").lower()
+            asset = SYMBOL_TO_ASSET.get(sym)
+            if asset is None:
+                continue
+            try:
+                val = float(payload["value"])
+                ts_ms = int(payload["timestamp"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            self.last_price[asset] = val
+            self.last_ts_ms[asset] = ts_ms
+            self._last_msg_mono = time.monotonic()
+            self._history[asset].append((ts_ms, val))
+
     @retry(wait=wait_exponential(multiplier=0.5, min=1, max=30), stop=stop_never)
     async def run(self) -> None:
         log.info("chainlink.connect", url=URL)
-        async with websockets.connect(URL, ping_interval=20, ping_timeout=15) as ws:
+        async with websockets.connect(URL, ping_interval=20, ping_timeout=15,
+                                       open_timeout=10) as ws:
             await ws.send(json.dumps(SUBSCRIBE))
             log.info("chainlink.subscribed")
-            async for raw in ws:
-                # Server may send PONG/ack frames or actual updates.
-                try:
-                    msg = orjson.loads(raw)
-                except (ValueError, TypeError):
-                    continue
-                if msg.get("topic") != "crypto_prices_chainlink":
-                    continue
-                payload = msg.get("payload") or {}
-                sym = (payload.get("symbol") or "").lower()
-                asset = SYMBOL_TO_ASSET.get(sym)
-                if asset is None:
-                    continue
-                try:
-                    val = float(payload["value"])
-                    ts_ms = int(payload["timestamp"])
-                except (KeyError, TypeError, ValueError):
-                    continue
-                self.last_price[asset] = val
-                self.last_ts_ms[asset] = ts_ms
-                self._history[asset].append((ts_ms, val))
+            self._last_msg_mono = time.monotonic()
+            # Run receiver + pinger + watchdog concurrently. First to fail
+            # (or watchdog tripping) cancels the others and re-raises so
+            # tenacity reconnects.
+            tasks = [
+                asyncio.create_task(self._receiver(ws)),
+                asyncio.create_task(self._pinger(ws)),
+                asyncio.create_task(self._watchdog()),
+            ]
+            try:
+                done, pending = await asyncio.wait(
+                    tasks, return_when=asyncio.FIRST_EXCEPTION
+                )
+                for t in pending:
+                    t.cancel()
+                for t in done:
+                    exc = t.exception()
+                    if exc:
+                        raise exc
+            finally:
+                for t in tasks:
+                    if not t.done():
+                        t.cancel()
