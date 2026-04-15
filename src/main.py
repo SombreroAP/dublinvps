@@ -8,7 +8,6 @@ import httpx
 from src.config import settings
 from src.feeds.binance import BinanceFeed
 from src.logging_setup import configure, log
-from src.polymarket.clob import PolyCLOB
 from src.polymarket.gamma import Market, fetch_active_markets
 from src.strategy.sniper import run_loop
 
@@ -18,7 +17,6 @@ async def main() -> None:
     log.info("startup", mode=settings.mode, edge_threshold=settings.edge_threshold)
 
     feed = BinanceFeed()
-    clob = PolyCLOB()
     feed_task = asyncio.create_task(feed.run())
 
     # Cache opening prices: snapped from Binance the moment we first see the market.
@@ -45,7 +43,7 @@ async def main() -> None:
                     openings[m.slug] = feed.last_price[m.asset]
             return cache["markets"], openings
 
-        await asyncio.gather(feed_task, run_loop(feed, clob, provider))
+        await asyncio.gather(feed_task, run_loop(feed, provider))
 
 
 if __name__ == "__main__":
