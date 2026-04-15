@@ -1,0 +1,27 @@
+[Unit]
+Description=Polymarket Crypto Sniper Bot
+After=network-online.target chrony.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sniper
+Group=sniper
+WorkingDirectory=/opt/sniper
+EnvironmentFile=/opt/sniper/.env
+ExecStart=/opt/sniper/.venv/bin/python -m src.main
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sniper
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/sniper/logs /opt/sniper/paper_trades.jsonl
+
+[Install]
+WantedBy=multi-user.target
