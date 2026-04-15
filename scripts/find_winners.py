@@ -111,29 +111,64 @@ def analyze_wallet(addr: str) -> dict:
 
 def main() -> None:
     print("=" * 60)
-    print(" PROBING LEADERBOARD ENDPOINTS")
+    print(" SCRAPING RECENT 5M CRYPTO TRADES (last ~3000)")
     print("=" * 60)
-    found_url, lb = probe_leaderboards()
-    if not lb:
-        print("\nNo leaderboard endpoint worked. Trying fallback: scrape recent trade history.")
-        # Fallback: pull last N trades on /trades, count by user
-        trades = curl_json("https://data-api.polymarket.com/trades?limit=500")
-        if not isinstance(trades, list):
-            print("Fallback failed.")
-            return
-        # Filter to 5m crypto trades only
-        crypto = [t for t in trades if CRYPTO_5M_RE.match(t.get("slug", "") or "")]
-        print(f"Recent 5m crypto trades: {len(crypto)}")
-        users = Counter(t.get("proxyWallet", "") for t in crypto)
-        candidates = [u for u, _ in users.most_common(20) if u]
-    else:
-        # Use leaderboard's top users
-        candidates = []
-        for entry in lb[:20]:
-            for k in ("user", "proxyWallet", "address", "wallet"):
-                if k in entry:
-                    candidates.append(entry[k])
-                    break
+    print("(global leaderboard skipped — top profit wallets trade big political/sports")
+    print(" markets, not 5m crypto microstructure. We need active 5m traders.)")
+    print()
+    all_crypto: list[dict] = []
+    for offset in range(0, 3000, 500):
+        page = curl_json(
+            f"https://data-api.polymarket.com/trades?limit=500&offset={offset}",
+            timeout=12,
+        )
+        if not isinstance(page, list) or not page:
+            break
+        crypto_page = [t for t in page if CRYPTO_5M_RE.match(t.get("slug", "") or "")]
+        all_crypto.extend(crypto_page)
+        print(f"  offset={offset:5d}: page={len(page)}  5m_crypto={len(crypto_page)}  "
+              f"running_total={len(all_crypto)}")
+        if len(page) < 500:
+            break
+    print(f"\nCollected {len(all_crypto)} 5m crypto trades")
+
+    if not all_crypto:
+        print("No 5m crypto trades available — feed may be sparse right now.")
+        return
+
+    # Count trades per wallet, prefer wallets with both BUY volume + variety
+    by_user: dict[str, dict] = {}
+    for t in all_crypto:
+        u = t.get("proxyWallet")
+        if not u:
+            continue
+        info = by_user.setdefault(u, {"trades": 0, "buys": 0, "usdc": 0.0,
+                                       "slugs": set(), "min_px": 1.0,
+                                       "max_px": 0.0})
+        info["trades"] += 1
+        info["slugs"].add(t.get("slug"))
+        info["usdc"] += float(t.get("usdcSize", 0))
+        if t.get("side") == "BUY":
+            info["buys"] += 1
+        try:
+            px = float(t.get("price", 0))
+            if 0 < px < info["min_px"]:
+                info["min_px"] = px
+            if px > info["max_px"]:
+                info["max_px"] = px
+        except (TypeError, ValueError):
+            pass
+
+    # Rank: prefer wallets with >=10 trades + >=5 unique markets + meaningful $$$
+    ranked = sorted(
+        [(u, i) for u, i in by_user.items()
+         if i["trades"] >= 5 and len(i["slugs"]) >= 3],
+        key=lambda kv: kv[1]["trades"], reverse=True,
+    )
+    print(f"\nUnique 5m crypto wallets: {len(by_user)}  "
+          f"(qualifying for analysis: {len(ranked)})")
+    print()
+    candidates = [u for u, _ in ranked[:25]]
 
     print(f"\nAnalyzing {len(candidates)} candidate wallets...")
     print()
