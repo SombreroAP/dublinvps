@@ -22,6 +22,14 @@ class Settings(BaseSettings):
     entry_window_start_sec: int = 45
     entry_window_end_sec: int = 5
 
+    # Per-second log-price volatility in bps. Used in Brownian fair_p model:
+    #   σ_remaining_bps = σ_per_sqrt_sec × √seconds_left
+    # Defaults are rough starting points from typical 5m realized vol.
+    # Tune after collecting real data.
+    sigma_bps_btc: float = 1.0
+    sigma_bps_eth: float = 1.2
+    sigma_bps_sol: float = 1.5
+
     # Mode
     mode: str = Field(default="paper", pattern="^(paper|live)$")
 

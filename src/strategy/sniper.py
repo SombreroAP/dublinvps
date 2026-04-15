@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from math import erf, sqrt
 from pathlib import Path
 
 import httpx
@@ -20,18 +21,39 @@ from src.polymarket.gamma import Market, fetch_clob_top
 PAPER_LOG = Path("paper_trades.jsonl")
 
 
-def fair_yes_probability(current: float, opening: float, seconds_left: float) -> float:
-    """Given a Chainlink move and time-to-settlement, how confident are we?"""
+def _sigma_bps(asset: str) -> float:
+    return {
+        "BTC": settings.sigma_bps_btc,
+        "ETH": settings.sigma_bps_eth,
+        "SOL": settings.sigma_bps_sol,
+    }.get(asset, 1.2)
+
+
+def _phi(z: float) -> float:
+    """Standard normal CDF."""
+    return 0.5 * (1.0 + erf(z / sqrt(2)))
+
+
+def fair_yes_probability(asset: str, current: float, opening: float,
+                         seconds_left: float) -> float:
+    """P(close ≥ open | current move so far, time remaining) under a zero-drift
+    Brownian model for log price. For a martingale, the probability that a
+    random walk ends above where it started, given current deviation x and
+    time-to-go (T-s), is Φ(x / (σ·√(T-s))).
+
+    move_bps: current deviation in bps
+    σ: per-√second volatility in bps (asset-dependent, configured).
+    Ties resolve UP on Polymarket → x ≥ 0 is UP.
+    """
     if seconds_left <= 0:
         return 1.0 if current >= opening else 0.0
     move_bps = (current - opening) / opening * 10_000
-    if seconds_left < 10 and abs(move_bps) > 1:
-        return 0.99 if move_bps > 0 else 0.01
-    if seconds_left < 30 and abs(move_bps) > 3:
-        return 0.95 if move_bps > 0 else 0.05
-    if seconds_left < 45 and abs(move_bps) > 5:
-        return 0.85 if move_bps > 0 else 0.15
-    return 0.5 + (0.05 if move_bps > 0 else -0.05)
+    sigma = _sigma_bps(asset)
+    sd_remaining_bps = sigma * sqrt(seconds_left)
+    if sd_remaining_bps < 1e-9:
+        return 1.0 if move_bps >= 0 else 0.0
+    z = move_bps / sd_remaining_bps
+    return _phi(z)
 
 
 async def evaluate_and_log(
@@ -46,7 +68,7 @@ async def evaluate_and_log(
     sec_left = market.seconds_remaining
     if not (settings.entry_window_end_sec < sec_left <= settings.entry_window_start_sec):
         return
-    p_yes = fair_yes_probability(current_price, opening_price, sec_left)
+    p_yes = fair_yes_probability(market.asset, current_price, opening_price, sec_left)
 
     # Use the cached ask to decide if signal-worthy; refetch live for logging.
     side = None

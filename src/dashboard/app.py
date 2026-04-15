@@ -215,18 +215,20 @@ def _compute_backtest() -> dict:
 _live_state_cache: tuple[float, list] | None = None
 
 
-def _fair_yes_p(current: float, opening: float, seconds_left: float) -> float:
-    """Mirror of strategy.sniper.fair_yes_probability — keep in sync."""
+def _fair_yes_p(asset: str, current: float, opening: float,
+                seconds_left: float) -> float:
+    """Mirror of strategy.sniper.fair_yes_probability (Brownian). Keep in sync."""
+    from math import erf, sqrt
+    sigma = {"BTC": settings.sigma_bps_btc, "ETH": settings.sigma_bps_eth,
+             "SOL": settings.sigma_bps_sol}.get(asset, 1.2)
     if seconds_left <= 0:
         return 1.0 if current >= opening else 0.0
     move_bps = (current - opening) / opening * 10_000
-    if seconds_left < 10 and abs(move_bps) > 1:
-        return 0.99 if move_bps > 0 else 0.01
-    if seconds_left < 30 and abs(move_bps) > 3:
-        return 0.95 if move_bps > 0 else 0.05
-    if seconds_left < 45 and abs(move_bps) > 5:
-        return 0.85 if move_bps > 0 else 0.15
-    return 0.5 + (0.05 if move_bps > 0 else -0.05)
+    sd = sigma * sqrt(seconds_left)
+    if sd < 1e-9:
+        return 1.0 if move_bps >= 0 else 0.0
+    z = move_bps / sd
+    return 0.5 * (1.0 + erf(z / sqrt(2)))
 
 
 def _taker_fee(rate: float, exponent: float, price: float) -> float:
@@ -299,7 +301,7 @@ def _compute_live_state() -> list[dict]:
         best_ask = None
         in_window = ENTRY_END < sec_left <= ENTRY_START
         if cur is not None and opening is not None:
-            fair_p = _fair_yes_p(cur, opening, sec_left)
+            fair_p = _fair_yes_p(asset, cur, opening, sec_left)
             if fair_p > 0.5 and yes_ask is not None and fee_rate is not None:
                 e = fair_p - yes_ask - _taker_fee(fee_rate, fee_exp, yes_ask)
                 if best_edge is None or e > best_edge:
