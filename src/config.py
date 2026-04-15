@@ -36,6 +36,10 @@ class Settings(BaseSettings):
     # news), not that we found an impossibly-good edge.
     max_disagreement: float = 0.30
 
+    # Minimum fair_p to fire a signal. Data: fair_p<0.85 wins ~25%, fair_p>=0.9
+    # wins ~87%. Below this threshold our Brownian model is too noisy to trust.
+    min_fair_p: float = 0.85
+
     # Mode
     mode: str = Field(default="paper", pattern="^(paper|live)$")
 
