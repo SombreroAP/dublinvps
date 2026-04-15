@@ -1,0 +1,26 @@
+[Unit]
+Description=Polymarket DD Shadow Bot (paper)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sniper
+Group=sniper
+WorkingDirectory=/opt/sniper
+EnvironmentFile=/opt/sniper/.env
+ExecStart=/opt/sniper/.venv/bin/python -m src.shadow.main
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=shadow
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/sniper/logs /opt/sniper/paper_trades_shadow.jsonl /opt/sniper/shadow_seen_hashes.txt
+
+[Install]
+WantedBy=multi-user.target

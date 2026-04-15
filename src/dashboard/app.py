@@ -27,6 +27,7 @@ from src.polymarket.gamma import fetch_active_markets
 
 PAPER_LOG = Path("/opt/sniper/paper_trades.jsonl")
 LADDER_LOG = Path("/opt/sniper/paper_trades_ladder.jsonl")
+SHADOW_LOG = Path("/opt/sniper/paper_trades_shadow.jsonl")
 CHAINLINK_CUTOFF = 1776250620  # systemd go-live; edit as needed
 
 DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD") or ""
@@ -261,6 +262,7 @@ def _compute_backtest() -> dict:
 
 _live_state_cache: tuple[float, list] | None = None
 _ladder_cache: tuple[float, dict] | None = None
+_shadow_cache: tuple[float, dict] | None = None
 # Cache of (slug, side_label) -> list of (price, size, ts) trades on the winning token.
 _trades_cache: dict[str, tuple[float, dict]] = {}
 
@@ -586,6 +588,105 @@ def _compute_live_state() -> list[dict]:
     return out
 
 
+def _compute_shadow_backtest() -> dict:
+    """Mirror Dimpled-Dill's trades. Each shadow signal is an attempt to copy
+    one of his BUY fills. Use the realistic fill simulator to estimate how
+    many of those we'd actually get (since we're 5-10s late + queue position).
+    """
+    global _shadow_cache
+    if _shadow_cache and time.time() - _shadow_cache[0] < 5:
+        return _shadow_cache[1]
+
+    rows: list[dict] = []
+    if SHADOW_LOG.exists():
+        with SHADOW_LOG.open() as f:
+            for line in f:
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+
+    # Group all shadow trades by (slug, side) — DD might fire multiple bids
+    # at different prices on the same market; we want each bid as a separate
+    # rung in our paper position.
+    by_key: dict[tuple[str, str], list[dict]] = {}
+    for r in rows:
+        k = (r["slug"], r["side"])
+        by_key.setdefault(k, []).append(r)
+
+    picks = []
+    tot_pl_real = 0.0
+    tot_staked_real = 0.0
+    wins = losses = pending = 0
+    dd_total_usdc = 0.0
+    for (slug, side), trades_list in sorted(
+            by_key.items(), key=lambda kv: kv[1][0]["ts"], reverse=True):
+        result = _fetch_resolution(slug)
+        # Build "ladder" from DD's actual fills on this side (price, usdc).
+        rungs = [(t["dd_price"], t["dd_usdc"]) for t in trades_list
+                 if t.get("dd_price", 0) > 0 and t.get("dd_usdc", 0) > 0]
+        dd_stake = sum(u for _, u in rungs)
+        dd_total_usdc += dd_stake
+
+        if result not in ("UP", "DOWN"):
+            picks.append({
+                "ts": trades_list[0]["ts"], "slug": slug,
+                "asset": trades_list[0]["asset"], "side": side,
+                "dd_stake": dd_stake, "real_stake": 0.0, "real_pl": 0.0,
+                "result": result, "fills_count": 0, "rungs_count": len(rungs),
+            })
+            pending += 1
+            continue
+
+        mkt = _fetch_market_trades(slug)
+        won = (side == "YES" and result == "UP") or \
+              (side == "NO" and result == "DOWN")
+        our_token = mkt["yes_token"] if side == "YES" else mkt["no_token"]
+        try:
+            round_start = int(slug.split("-")[-1])
+        except (ValueError, IndexError):
+            round_start = 0
+        round_end = round_start + 300
+
+        # Use simulator to determine which of DD's bid prices would have
+        # filled FOR US (we're 5-10s behind). The simulator counts ANY trade
+        # at-or-below our price, so it's still optimistic but honest about
+        # the price-trade-through condition.
+        shares_we_get, breakdown = _simulate_fills(
+            rungs, our_token, mkt["trades"], round_start, round_end,
+        )
+        real_stake = sum(b["usdc"] for b in breakdown if b["filled"])
+        real_pl = shares_we_get * (1.0 if won else 0.0) - real_stake
+        fills_count = sum(1 for b in breakdown if b["filled"])
+        if real_stake > 0:
+            if real_pl > 0:
+                wins += 1
+            else:
+                losses += 1
+        tot_pl_real += real_pl
+        tot_staked_real += real_stake
+        picks.append({
+            "ts": trades_list[0]["ts"], "slug": slug,
+            "asset": trades_list[0]["asset"], "side": side,
+            "dd_stake": dd_stake, "real_stake": real_stake, "real_pl": real_pl,
+            "result": "WIN" if won else "LOSS",
+            "fills_count": fills_count, "rungs_count": len(rungs),
+        })
+
+    out = {
+        "total_signals": len(rows),
+        "unique_picks": len(by_key),
+        "wins": wins, "losses": losses, "pending": pending,
+        "win_rate": (wins / (wins + losses)) if (wins + losses) else None,
+        "total_pl_real": tot_pl_real,
+        "total_staked_real": tot_staked_real,
+        "dd_total_usdc": dd_total_usdc,
+        "picks": picks[:50],
+    }
+    _shadow_cache = (time.time(), out)
+    return out
+
+
 def _bot_status() -> dict:
     try:
         out = subprocess.check_output(
@@ -611,6 +712,7 @@ def api_summary(_=Depends(_check_auth)) -> JSONResponse:
         "backtest": bt,
         "live": _compute_live_state(),
         "ladder": _compute_ladder_backtest(),
+        "shadow": _compute_shadow_backtest(),
     })
 
 
@@ -702,6 +804,21 @@ tr:hover td { background:#192029; }
     <tr><th>Time</th><th>Asset</th><th>Side</th><th>z</th><th>Move</th><th>Open</th><th>Current</th><th>Stake</th><th>Result</th><th>Optimistic P&amp;L</th><th>Real Stake</th><th>Real P&amp;L</th><th>Filled</th><th>Slug</th></tr>
   </thead><tbody></tbody></table>
   <div id="ladder_empty" class="mut" style="padding:12px 4px; display:none">No ladder signals yet. Fires when |z| ≥ 2 at T-90s to T-45s.</div>
+</div>
+
+<div class="card" style="margin:0 16px 16px; border-color:#1a4a4a">
+  <h2 style="color:#39c5bb">👁 Shadow bot (mirror Dimpled-Dill)
+    <span id="shadow_summary" class="mut" style="font-weight:400; margin-left:8px"></span>
+  </h2>
+  <div class="mut" style="font-size:11px; padding:2px 0 8px">
+    Polls DD's activity API every 5s. Each new BUY of his is mirrored as a
+    paper bid at the same price/size. Realistic P&amp;L uses fill simulator
+    (we're 5-10s behind him + queue position behind his orders).
+  </div>
+  <table id="shadow_tbl"><thead>
+    <tr><th>Time</th><th>Asset</th><th>Side</th><th>DD stake</th><th>Rungs</th><th>Filled</th><th>Real stake</th><th>Result</th><th>Real P&amp;L</th><th>Slug</th></tr>
+  </thead><tbody></tbody></table>
+  <div id="shadow_empty" class="mut" style="padding:12px 4px; display:none">No shadow signals yet. Wait for DD to fire a trade.</div>
 </div>
 
 <div class="card" style="margin:0 16px 16px">
@@ -913,6 +1030,42 @@ async function refresh() {
           <td>${filledStr}</td>
           <td class="mut">${p.slug}</td>`;
         ladderBody.appendChild(tr);
+      }
+    }
+
+    // Shadow bot rendering
+    const shadow = d.shadow || {};
+    const shadowBody = document.querySelector("#shadow_tbl tbody");
+    if (shadowBody) {
+      shadowBody.innerHTML = "";
+      const sp = shadow.picks || [];
+      const swr = shadow.win_rate==null ? "—" : (shadow.win_rate*100).toFixed(1)+"%";
+      const spl = shadow.total_pl_real || 0;
+      const splS = (spl>=0?"+":"") + "$" + spl.toFixed(2);
+      const splCls = spl>0?"ok":spl<0?"bad":"mut";
+      const sstk = shadow.total_staked_real || 0;
+      const ddstk = shadow.dd_total_usdc || 0;
+      document.getElementById("shadow_summary").innerHTML =
+        `<span class="${splCls}">${splS}</span> · ${swr} win rate · ${shadow.wins||0}W/${shadow.losses||0}L/${shadow.pending||0}P · we staked $${sstk.toFixed(2)} of DD's $${ddstk.toFixed(2)}`;
+      document.getElementById("shadow_empty").style.display = sp.length ? "none" : "block";
+      for (const p of sp) {
+        const t = new Date(p.ts*1000).toLocaleTimeString();
+        const sideCls = p.side==="YES" ? "ok" : "bad";
+        const sideArrow = p.side==="YES" ? "↑ UP" : "↓ DOWN";
+        const splS2 = (p.real_pl>=0?"+":"") + "$" + p.real_pl.toFixed(2);
+        const splCls2 = p.real_pl>0?"ok":p.real_pl<0?"bad":"mut";
+        const fillStr = p.rungs_count ? `${p.fills_count}/${p.rungs_count}` : "—";
+        const tr = document.createElement("tr");
+        tr.innerHTML = `<td class="mut">${t}</td><td>${p.asset}</td>
+          <td class="${sideCls}">${sideArrow}</td>
+          <td>$${(p.dd_stake||0).toFixed(2)}</td>
+          <td>${p.rungs_count}</td>
+          <td>${fillStr}</td>
+          <td>$${(p.real_stake||0).toFixed(2)}</td>
+          <td><span class="pill ${p.result}">${p.result}</span></td>
+          <td class="${splCls2}">${splS2}</td>
+          <td class="mut">${p.slug}</td>`;
+        shadowBody.appendChild(tr);
       }
     }
 
