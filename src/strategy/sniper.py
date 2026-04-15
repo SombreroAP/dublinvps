@@ -92,19 +92,28 @@ async def evaluate_and_log(
     if cached_edge < settings.edge_threshold - 0.03:
         return
 
-    # Live refetch with DEPTH — compute the VWAP ask we'd actually pay for
-    # our position size, not the dust-order best ask. This kills the
-    # "$25 at 0.001 ask" fantasy fills.
+    # Live book refetch with DEPTH. Compute:
+    #   fill_ask    — VWAP price we'd actually pay for our desired size
+    #   market_mid  — (best_bid + best_ask)/2 of the side we're buying; this
+    #                 is the market's own implied probability that our side wins.
+    # If our fair_p disagrees with the market by too much, SKIP — the market
+    # likely has information (e.g. Binance/Chainlink divergence) we don't.
     refetch_start = time.monotonic()
     desired_size = settings.max_position_usdc
-    fill_ask, best_ask, fillable = await fetch_clob_fill_ask(
-        http, token_id, desired_size,
-    )
+    bids, asks = await fetch_clob_book(http, token_id)
     price_age_ms = int((time.monotonic() - refetch_start) * 1000)
-    if fill_ask is None:
+    if not asks:
         return
-    # If the book can't absorb at least $5 of our order, skip — dust.
-    if fillable < 5.0:
+    best_ask = asks[0][0]
+    best_bid = bids[0][0] if bids else None
+    fill_ask, fillable = sweep_fill_ask(asks, desired_size)
+    if fill_ask is None or fillable < 5.0:  # dust book
+        return
+    # Market's implied probability for OUR side. Use mid if we have both,
+    # else fall back to best_ask.
+    market_implied = ((best_bid + best_ask) / 2) if (best_bid is not None) else best_ask
+    disagreement = abs(target_p - market_implied)
+    if disagreement > settings.max_disagreement:
         return
 
     fee = market.taker_fee_at(fill_ask)
@@ -113,7 +122,9 @@ async def evaluate_and_log(
         return
 
     key = (market.slug, side)
-    fingerprint = (round(fill_ask, 4), round(target_p, 3))
+    # Tighter dedup: fingerprint on fill_ask rounded to 2dp + fair_p to 2dp.
+    # Small orderbook wobbles no longer trigger new log lines.
+    fingerprint = (round(fill_ask, 2), round(target_p, 2))
     if last_sig.get(key) == fingerprint:
         return
     last_sig[key] = fingerprint
@@ -123,6 +134,9 @@ async def evaluate_and_log(
         "side": side,
         "ask": fill_ask,                       # VWAP we'd actually pay
         "best_ask": best_ask,                  # top-of-book reference
+        "best_bid": best_bid,
+        "market_implied_p": market_implied,    # (bid+ask)/2 of our side
+        "disagreement": disagreement,
         "cached_ask_at_discovery": cached_ask,
         "fillable_usdc": fillable,
         "price_age_ms": price_age_ms,
