@@ -304,10 +304,13 @@ def _compute_live_state() -> list[dict]:
         # Decision string
         threshold = settings.edge_threshold
         if not in_window:
+            def _mmss(s: float) -> str:
+                s = max(0, int(s))
+                return f"{s // 60}:{s % 60:02d}"
             if sec_left > ENTRY_START:
-                state = f"waiting — window opens in {int(sec_left - ENTRY_START)}s"
+                state = f"waiting — window opens in {_mmss(sec_left - ENTRY_START)}"
             else:
-                state = f"past entry window (T-{max(0, int(sec_left))}s)"
+                state = f"past entry window (T-{_mmss(sec_left)})"
             action = None
         elif best_edge is None or best_edge <= threshold:
             state = f"in window — no edge (best {((best_edge or 0)*100):+.1f}%)"
@@ -477,6 +480,7 @@ async function refresh() {
       if (!el) continue;
       const body = el.querySelector(".live_body");
       const secLeft = s.seconds_left|0;
+      const mmss = `${Math.floor(Math.max(0,secLeft)/60)}:${String(Math.max(0,secLeft)%60).padStart(2,"0")}`;
       const inWin = s.in_window;
       const dir = s.move_bps==null ? "—" : (s.move_bps>=0 ? "↑" : "↓");
       const dirCls = s.move_bps==null ? "mut" : (s.move_bps>0 ? "ok" : s.move_bps<0 ? "bad" : "mut");
@@ -487,7 +491,7 @@ async function refresh() {
       if (s.action) stateCls = "ok";
       else if (inWin) stateCls = "warn";
       body.innerHTML = `
-        <div class="kv"><span class="k">Round ends in</span><span class="v ${inWin?"warn":""}">${secLeft}s ${inWin?"· IN WINDOW":""}</span></div>
+        <div class="kv"><span class="k">Round ends in</span><span class="v ${inWin?"warn":""}">${mmss} ${inWin?"· IN WINDOW":""}</span></div>
         <div class="kv"><span class="k">Open px</span><span class="v">${fmtPx(s.opening, s.asset)}</span></div>
         <div class="kv"><span class="k">Live px</span><span class="v">${fmtPx(s.current, s.asset)}</span></div>
         <div class="kv"><span class="k">Move</span><span class="v ${dirCls}">${moveStr}</span></div>
