@@ -610,7 +610,10 @@ def _compute_live_state() -> list[dict]:
 
 
 def _compute_one_wallet_shadow(label: str, log_path: Path) -> dict:
-    """Backtest one shadow log file. Returns per-wallet stats + picks."""
+    """Backtest one shadow log file. Returns per-wallet stats + picks.
+    Caps to last MAX_PICKS (slug,side) groups to avoid slowness on legacy
+    logs with hundreds of pending picks (each one = ~3 subprocess curls)."""
+    MAX_PICKS_PER_WALLET = 80
     rows: list[dict] = []
     if log_path.exists():
         with log_path.open() as f:
@@ -623,6 +626,10 @@ def _compute_one_wallet_shadow(label: str, log_path: Path) -> dict:
     for r in rows:
         k = (r["slug"], r["side"])
         by_key.setdefault(k, []).append(r)
+    # Keep only most-recent MAX_PICKS groups (by first-trade timestamp).
+    if len(by_key) > MAX_PICKS_PER_WALLET:
+        ranked = sorted(by_key.items(), key=lambda kv: kv[1][0]["ts"], reverse=True)
+        by_key = dict(ranked[:MAX_PICKS_PER_WALLET])
 
     picks = []
     tot_pl_real = 0.0

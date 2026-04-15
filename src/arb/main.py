@@ -27,10 +27,12 @@ from src.polymarket.gamma import Market, fetch_active_markets, fetch_clob_fill_a
 PAPER_LOG = Path("paper_trades_arb.jsonl")
 
 # Tunables
-ARB_MIN_PROFIT = -0.05        # diagnostic: log near-misses too (up to 5% loss after fees)
-POSITION_USDC = 10.0          # desired fill size per side
+# Back to profitable-only: 59% full-hedge rate confirmed in diagnostic mode.
+# Keep 250ms poll since we know momentary gaps exist and they close fast.
+ARB_MIN_PROFIT = 0.005        # 0.5% minimum — anything positive after fees
+POSITION_USDC = 10.0
 GAMMA_TTL = 3.0
-POLL_SEC = 0.25               # aggressive polling — catch momentary gaps
+POLL_SEC = 0.5                # balanced: not pounding CLOB, but catches gaps
 
 
 def estimate_net_profit(yes_ask: float, no_ask: float,
