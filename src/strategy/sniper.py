@@ -34,25 +34,36 @@ def _phi(z: float) -> float:
     return 0.5 * (1.0 + erf(z / sqrt(2)))
 
 
+def compute_z(asset: str, current: float, opening: float,
+              seconds_left: float) -> tuple[float, float, float]:
+    """Return (z_score, move_bps, sd_remaining_bps). z = move / σ·√(T-s).
+    z is in units of "how many standard deviations the move so far is vs the
+    expected volatility in the remaining time." Large |z| = move dominates
+    noise budget = likely to stick. Small |z| = move is within noise = fragile.
+    """
+    if opening <= 0 or seconds_left <= 0:
+        return 0.0, 0.0, 0.0
+    move_bps = (current - opening) / opening * 10_000
+    sigma = _sigma_bps(asset)
+    sd_remaining_bps = sigma * sqrt(seconds_left)
+    if sd_remaining_bps < 1e-9:
+        return (float("inf") if move_bps > 0 else float("-inf") if move_bps < 0 else 0.0,
+                move_bps, sd_remaining_bps)
+    return move_bps / sd_remaining_bps, move_bps, sd_remaining_bps
+
+
 def fair_yes_probability(asset: str, current: float, opening: float,
                          seconds_left: float) -> float:
     """P(close ≥ open | current move so far, time remaining) under a zero-drift
     Brownian model for log price. For a martingale, the probability that a
     random walk ends above where it started, given current deviation x and
     time-to-go (T-s), is Φ(x / (σ·√(T-s))).
-
-    move_bps: current deviation in bps
-    σ: per-√second volatility in bps (asset-dependent, configured).
-    Ties resolve UP on Polymarket → x ≥ 0 is UP.
     """
     if seconds_left <= 0:
         return 1.0 if current >= opening else 0.0
-    move_bps = (current - opening) / opening * 10_000
-    sigma = _sigma_bps(asset)
-    sd_remaining_bps = sigma * sqrt(seconds_left)
-    if sd_remaining_bps < 1e-9:
-        return 1.0 if move_bps >= 0 else 0.0
-    z = move_bps / sd_remaining_bps
+    z, _, sd = compute_z(asset, current, opening, seconds_left)
+    if sd < 1e-9:
+        return 1.0 if current >= opening else 0.0
     return _phi(z)
 
 
@@ -68,6 +79,15 @@ async def evaluate_and_log(
     sec_left = market.seconds_remaining
     if not (settings.entry_window_end_sec < sec_left <= settings.entry_window_start_sec):
         return
+
+    # z-score gate: the move so far must be statistically significant vs the
+    # expected remaining volatility. Small moves with lots of time left are
+    # fragile — they reverse. Data showed 4/4 historical losses had |z|<1.5.
+    z, move_bps, sd_rem = compute_z(market.asset, current_price,
+                                     opening_price, sec_left)
+    if abs(z) < settings.min_z_score:
+        return
+
     p_yes = fair_yes_probability(market.asset, current_price, opening_price, sec_left)
 
     # Use the cached ask to decide if signal-worthy; refetch live for logging.
@@ -160,6 +180,7 @@ async def evaluate_and_log(
         "fillable_usdc": fillable,
         "price_age_ms": price_age_ms,
         "fair_p": target_p, "edge": edge, "fee": fee,
+        "z_score": z, "move_bps": move_bps, "sd_remaining_bps": sd_rem,
         "current": current_price, "opening": opening_price, "sec_left": sec_left,
         "size_usdc": min(fillable, settings.max_position_usdc,
                          settings.max_position_usdc * edge / 0.05),

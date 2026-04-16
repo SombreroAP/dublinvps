@@ -40,6 +40,12 @@ class Settings(BaseSettings):
     # wins ~87%. Below this threshold our Brownian model is too noisy to trust.
     min_fair_p: float = 0.85
 
+    # Require the Chainlink move to be at least N standard deviations from 0
+    # relative to remaining volatility. |z| = move_bps / (sigma * sqrt(sec_left)).
+    # z >= 2.0 means "move is too big to plausibly reverse from noise alone."
+    # Data showed 4/4 historical losses had |z|<1.5 (fragile tiny moves).
+    min_z_score: float = 2.0
+
     # Sides enabled. Data as of first 34 realistic picks: YES won 75% / +$90,
     # NO won 57% / -$95. Turning NO off removed the losing leg entirely.
     # Change to "YES,NO" once/if NO performance improves.
