@@ -26,9 +26,6 @@ from src.feeds.chainlink import ChainlinkFeed
 from src.polymarket.gamma import fetch_active_markets
 
 PAPER_LOG = Path("/opt/sniper/paper_trades.jsonl")
-SHADOW_DIR = Path("/opt/sniper")  # paper_trades_shadow_<label>.jsonl files
-LEGACY_SHADOW_LOG = Path("/opt/sniper/paper_trades_shadow.jsonl")  # pre-multi-wallet
-ARB_LOG = Path("/opt/sniper/paper_trades_arb.jsonl")
 CHAINLINK_CUTOFF = 1776250620  # systemd go-live; edit as needed
 
 DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD") or ""
@@ -267,115 +264,6 @@ def _compute_backtest() -> dict:
 
 
 _live_state_cache: tuple[float, list] | None = None
-_shadow_cache: tuple[float, dict] | None = None
-_arb_cache: tuple[float, dict] | None = None
-
-
-def _compute_arb_backtest() -> dict:
-    """Each arb signal is a paired (YES + NO) purchase. If we fill BOTH sides
-    on-chain (simulator: trades at-or-below our bid price on each token during
-    the round), we're guaranteed $1 of payoff per share. Paper P&L = net_profit
-    × min(fillable_usdc_each_side, desired_size).
-    """
-    global _arb_cache
-    if _arb_cache and time.time() - _arb_cache[0] < 5:
-        return _arb_cache[1]
-
-    rows: list[dict] = []
-    if ARB_LOG.exists():
-        with ARB_LOG.open() as f:
-            for line in f:
-                try:
-                    rows.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
-    # One best (highest-profit) signal per slug
-    best: dict[str, dict] = {}
-    for r in rows:
-        slug = r["slug"]
-        if slug not in best or r["net_profit_per_usd"] > best[slug]["net_profit_per_usd"]:
-            best[slug] = r
-
-    picks = []
-    tot_real_pl = 0.0
-    tot_real_stake = 0.0
-    wins = 0  # fully-hedged
-    partial = 0  # only one side filled
-    pending = 0
-    zero = 0  # neither side filled
-    for slug, r in sorted(best.items(), key=lambda kv: kv[1]["ts"], reverse=True):
-        resolution = _fetch_resolution(slug)
-        if resolution not in ("UP", "DOWN"):
-            pending += 1
-            picks.append({
-                **r, "sim_status": "pending",
-                "real_stake": 0.0, "real_pl": 0.0, "yes_filled": False, "no_filled": False,
-            })
-            continue
-        mkt = _fetch_market_trades(slug)
-        try:
-            round_start = int(slug.split("-")[-1])
-        except (ValueError, IndexError):
-            round_start = 0
-        round_end = round_start + 300
-        size_each = r.get("position_usdc_each_side", 10.0)
-        # Simulate both sides
-        yes_shares, yes_bd = _simulate_fills(
-            [(r["yes_ask"], size_each)], mkt["yes_token"],
-            mkt["trades"], round_start, round_end,
-        )
-        no_shares, no_bd = _simulate_fills(
-            [(r["no_ask"], size_each)], mkt["no_token"],
-            mkt["trades"], round_start, round_end,
-        )
-        yes_filled = yes_bd[0]["filled"] if yes_bd else False
-        no_filled = no_bd[0]["filled"] if no_bd else False
-        yes_stake = yes_bd[0]["usdc"] if yes_filled else 0.0
-        no_stake = no_bd[0]["usdc"] if no_filled else 0.0
-        real_stake = yes_stake + no_stake
-
-        # Payoff: winning side pays $1 per share
-        if resolution == "UP":
-            payoff = yes_shares * 1.0  # only YES pays
-        else:
-            payoff = no_shares * 1.0
-        # Fees (taker): applied to whichever sides filled
-        fee_rate_default = 0.072
-        fee_yes = _taker_fee(fee_rate_default, 1.0, r["yes_ask"]) * yes_stake if yes_filled else 0.0
-        fee_no = _taker_fee(fee_rate_default, 1.0, r["no_ask"]) * no_stake if no_filled else 0.0
-        real_pl = payoff - real_stake - fee_yes - fee_no
-        tot_real_pl += real_pl
-        tot_real_stake += real_stake
-
-        if yes_filled and no_filled:
-            wins += 1
-            status = "HEDGED"
-        elif yes_filled or no_filled:
-            partial += 1
-            status = "PARTIAL"
-        else:
-            zero += 1
-            status = "NO FILL"
-
-        picks.append({
-            **r, "sim_status": status, "real_stake": real_stake,
-            "real_pl": real_pl, "yes_filled": yes_filled, "no_filled": no_filled,
-            "resolution": resolution,
-        })
-
-    out = {
-        "total_signals": len(rows),
-        "unique_markets": len(best),
-        "hedged": wins,                 # both sides filled
-        "partial": partial,             # only one side filled (directional risk)
-        "no_fill": zero,                # neither side filled
-        "pending": pending,
-        "total_real_pl": tot_real_pl,
-        "total_real_stake": tot_real_stake,
-        "picks": picks[:30],
-    }
-    _arb_cache = (time.time(), out)
-    return out
 # Cache of (slug, side_label) -> list of (price, size, ts) trades on the winning token.
 _trades_cache: dict[str, tuple[float, dict]] = {}
 
@@ -609,129 +497,6 @@ def _compute_live_state() -> list[dict]:
     return out
 
 
-def _compute_one_wallet_shadow(label: str, log_path: Path) -> dict:
-    """Backtest one shadow log file. Returns per-wallet stats + picks.
-    Caps to last MAX_PICKS (slug,side) groups to avoid slowness on legacy
-    logs with hundreds of pending picks (each one = ~3 subprocess curls)."""
-    MAX_PICKS_PER_WALLET = 80
-    rows: list[dict] = []
-    if log_path.exists():
-        with log_path.open() as f:
-            for line in f:
-                try:
-                    rows.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
-    by_key: dict[tuple[str, str], list[dict]] = {}
-    for r in rows:
-        k = (r["slug"], r["side"])
-        by_key.setdefault(k, []).append(r)
-    # Keep only most-recent MAX_PICKS groups (by first-trade timestamp).
-    if len(by_key) > MAX_PICKS_PER_WALLET:
-        ranked = sorted(by_key.items(), key=lambda kv: kv[1][0]["ts"], reverse=True)
-        by_key = dict(ranked[:MAX_PICKS_PER_WALLET])
-
-    picks = []
-    tot_pl_real = 0.0
-    tot_staked_real = 0.0
-    wins = losses = pending = 0
-    leader_total_usdc = 0.0
-    for (slug, side), trades_list in sorted(
-            by_key.items(), key=lambda kv: kv[1][0]["ts"], reverse=True):
-        result = _fetch_resolution(slug)
-        rungs = [(t["dd_price"], t["dd_usdc"]) for t in trades_list
-                 if t.get("dd_price", 0) > 0 and t.get("dd_usdc", 0) > 0]
-        leader_stake = sum(u for _, u in rungs)
-        leader_total_usdc += leader_stake
-
-        if result not in ("UP", "DOWN"):
-            picks.append({
-                "ts": trades_list[0]["ts"], "slug": slug,
-                "asset": trades_list[0]["asset"], "side": side,
-                "leader_stake": leader_stake, "real_stake": 0.0, "real_pl": 0.0,
-                "result": result, "fills_count": 0, "rungs_count": len(rungs),
-            })
-            pending += 1
-            continue
-
-        mkt = _fetch_market_trades(slug)
-        won = (side == "YES" and result == "UP") or \
-              (side == "NO" and result == "DOWN")
-        our_token = mkt["yes_token"] if side == "YES" else mkt["no_token"]
-        try:
-            round_start = int(slug.split("-")[-1])
-        except (ValueError, IndexError):
-            round_start = 0
-        round_end = round_start + 300
-
-        shares_we_get, breakdown = _simulate_fills(
-            rungs, our_token, mkt["trades"], round_start, round_end,
-        )
-        real_stake = sum(b["usdc"] for b in breakdown if b["filled"])
-        real_pl = shares_we_get * (1.0 if won else 0.0) - real_stake
-        fills_count = sum(1 for b in breakdown if b["filled"])
-        if real_stake > 0:
-            if real_pl > 0:
-                wins += 1
-            else:
-                losses += 1
-        tot_pl_real += real_pl
-        tot_staked_real += real_stake
-        picks.append({
-            "ts": trades_list[0]["ts"], "slug": slug,
-            "asset": trades_list[0]["asset"], "side": side,
-            "leader_stake": leader_stake, "real_stake": real_stake,
-            "real_pl": real_pl,
-            "result": "WIN" if won else "LOSS",
-            "fills_count": fills_count, "rungs_count": len(rungs),
-        })
-
-    return {
-        "label": label,
-        "total_signals": len(rows),
-        "unique_picks": len(by_key),
-        "wins": wins, "losses": losses, "pending": pending,
-        "win_rate": (wins / (wins + losses)) if (wins + losses) else None,
-        "total_pl_real": tot_pl_real,
-        "total_staked_real": tot_staked_real,
-        "leader_total_usdc": leader_total_usdc,
-        "picks": picks[:30],
-    }
-
-
-def _compute_shadow_backtest() -> dict:
-    """Multi-wallet: read all paper_trades_shadow_<label>.jsonl files plus the
-    legacy single-file log, compute per-wallet backtest, return aggregate."""
-    global _shadow_cache
-    if _shadow_cache and time.time() - _shadow_cache[0] < 5:
-        return _shadow_cache[1]
-
-    wallets = []
-    # Discover per-wallet log files
-    for path in sorted(SHADOW_DIR.glob("paper_trades_shadow_*.jsonl")):
-        label = path.stem.replace("paper_trades_shadow_", "")
-        wallets.append(_compute_one_wallet_shadow(label, path))
-    # Include legacy single-file log if present and non-empty
-    if LEGACY_SHADOW_LOG.exists() and LEGACY_SHADOW_LOG.stat().st_size > 0:
-        wallets.append(_compute_one_wallet_shadow("dd_legacy", LEGACY_SHADOW_LOG))
-
-    out = {
-        "wallets": wallets,
-        "aggregate": {
-            "total_signals":     sum(w["total_signals"] for w in wallets),
-            "unique_picks":      sum(w["unique_picks"] for w in wallets),
-            "wins":              sum(w["wins"] for w in wallets),
-            "losses":            sum(w["losses"] for w in wallets),
-            "pending":           sum(w["pending"] for w in wallets),
-            "total_pl_real":     sum(w["total_pl_real"] for w in wallets),
-            "total_staked_real": sum(w["total_staked_real"] for w in wallets),
-            "leader_total_usdc": sum(w["leader_total_usdc"] for w in wallets),
-        },
-    }
-    _shadow_cache = (time.time(), out)
-    return out
-
-
 def _bot_status() -> dict:
     try:
         out = subprocess.check_output(
@@ -772,8 +537,6 @@ def api_summary(_=Depends(_check_auth)) -> JSONResponse:
         },
         "backtest": _safe_call("backtest", _compute_backtest),
         "live":     _safe_call("live",     _compute_live_state),
-        "shadow":   _safe_call("shadow",   _compute_shadow_backtest),
-        "arb":      _safe_call("arb",      _compute_arb_backtest),
     })
 
 
@@ -850,33 +613,6 @@ tr:hover td { background:#192029; }
     <tr><th>Time</th><th>Asset</th><th>Target</th><th>Ask</th><th>Fair p</th><th>Edge</th><th>Size</th><th>Open px</th><th>Close px</th><th>Expected</th><th>Est P&amp;L</th><th>Slug</th></tr>
   </thead><tbody></tbody></table>
   <div id="pending_empty" class="mut" style="padding:12px 4px; display:none">No picks awaiting resolution.</div>
-</div>
-
-<div class="card" style="margin:0 16px 16px; border-color:#4a3a1a">
-  <h2 style="color:#d29922">⚖ Arbitrage bot (convergence)
-    <span id="arb_summary" class="mut" style="font-weight:400; margin-left:8px"></span>
-  </h2>
-  <div class="mut" style="font-size:11px; padding:2px 0 8px">
-    Detects moments when YES_ask + NO_ask + fees &lt; 1.0 on active 5m crypto
-    markets — buying both sides locks in guaranteed profit. Paper fills use
-    trade-history simulator (both sides must fill to capture the hedge).
-  </div>
-  <table id="arb_tbl"><thead>
-    <tr><th>Time</th><th>Asset</th><th>YES ask</th><th>NO ask</th><th>Spread</th><th>Net%</th><th>Depth Y</th><th>Depth N</th><th>Status</th><th>Real Stake</th><th>Real P&amp;L</th><th>Slug</th></tr>
-  </thead><tbody></tbody></table>
-  <div id="arb_empty" class="mut" style="padding:12px 4px; display:none">No arb opportunities yet. Watching every 1s.</div>
-</div>
-
-<div class="card" style="margin:0 16px 16px; border-color:#1a4a4a">
-  <h2 style="color:#39c5bb">👁 Shadow bots (multi-wallet)
-    <span id="shadow_aggregate" class="mut" style="font-weight:400; margin-left:8px"></span>
-  </h2>
-  <div class="mut" style="font-size:11px; padding:2px 0 8px">
-    Mirrors trades from multiple Polymarket wallets in parallel. Each wallet's
-    P&amp;L tracked separately so we can identify which strategy is currently
-    profitable. Realistic fill simulator applied to all picks.
-  </div>
-  <div id="shadow_wallets"></div>
 </div>
 
 <div class="card" style="margin:0 16px 16px">
@@ -1044,104 +780,6 @@ async function refresh() {
         <td class="${eplCls}">${epl}</td>
         <td class="mut">${p.slug}</td>`;
       pendingBody.appendChild(tr);
-    }
-
-    // Arb bot rendering
-    const arb = d.arb || {};
-    const arbBody = document.querySelector("#arb_tbl tbody");
-    if (arbBody) {
-      arbBody.innerHTML = "";
-      const ap = arb.picks || [];
-      const arbPl = arb.total_real_pl || 0;
-      const arbPlS = (arbPl>=0?"+":"") + "$" + arbPl.toFixed(2);
-      const arbPlCls = arbPl>0?"ok":arbPl<0?"bad":"mut";
-      document.getElementById("arb_summary").innerHTML =
-        `<span class="${arbPlCls}">${arbPlS}</span> · ${arb.hedged||0} fully hedged, ${arb.partial||0} partial, ${arb.no_fill||0} no-fill, ${arb.pending||0} pending · ${arb.unique_markets||0} markets tracked (${arb.total_signals||0} signals)`;
-      document.getElementById("arb_empty").style.display = ap.length ? "none" : "block";
-      for (const p of ap) {
-        const t = new Date(p.ts*1000).toLocaleTimeString();
-        const statusColors = {HEDGED: "ok", PARTIAL: "warn", "NO FILL": "mut", pending: "mut"};
-        const stCls = statusColors[p.sim_status] || "mut";
-        const plS = (p.real_pl>=0?"+":"") + "$" + (p.real_pl||0).toFixed(2);
-        const plCls = p.real_pl>0?"ok":p.real_pl<0?"bad":"mut";
-        const tr = document.createElement("tr");
-        tr.innerHTML = `<td class="mut">${t}</td><td>${p.asset}</td>
-          <td>${p.yes_ask.toFixed(3)}</td>
-          <td>${p.no_ask.toFixed(3)}</td>
-          <td>${p.arb_spread.toFixed(3)}</td>
-          <td class="ok">${(p.net_profit_per_usd*100).toFixed(2)}%</td>
-          <td>$${(p.fillable_yes_usdc||0).toFixed(1)}</td>
-          <td>$${(p.fillable_no_usdc||0).toFixed(1)}</td>
-          <td class="${stCls}">${p.sim_status}</td>
-          <td>$${(p.real_stake||0).toFixed(2)}</td>
-          <td class="${plCls}">${plS}</td>
-          <td class="mut">${p.slug}</td>`;
-        arbBody.appendChild(tr);
-      }
-    }
-
-    // Multi-wallet shadow rendering
-    const shadow = d.shadow || {};
-    const agg = shadow.aggregate || {};
-    const wallets = shadow.wallets || [];
-    const aggPl = agg.total_pl_real || 0;
-    const aggPlS = (aggPl>=0?"+":"") + "$" + aggPl.toFixed(2);
-    const aggPlCls = aggPl>0?"ok":aggPl<0?"bad":"mut";
-    const aggWR = (agg.wins+agg.losses)
-      ? `${(agg.wins/(agg.wins+agg.losses)*100).toFixed(1)}%`
-      : "—";
-    document.getElementById("shadow_aggregate").innerHTML =
-      `aggregate <span class="${aggPlCls}">${aggPlS}</span> · ${aggWR} win rate · ${agg.wins||0}W/${agg.losses||0}L/${agg.pending||0}P across ${wallets.length} wallet(s)`;
-
-    const container = document.getElementById("shadow_wallets");
-    if (container) {
-      container.innerHTML = "";
-      for (const w of wallets) {
-        const wPl = w.total_pl_real || 0;
-        const wPlS = (wPl>=0?"+":"") + "$" + wPl.toFixed(2);
-        const wPlCls = wPl>0?"ok":wPl<0?"bad":"mut";
-        const wWR = w.win_rate==null ? "—" : (w.win_rate*100).toFixed(1)+"%";
-        const sec = document.createElement("div");
-        sec.style.cssText = "margin-top:14px; padding-top:10px; border-top:1px dashed #1f2730";
-        sec.innerHTML = `
-          <h3 style="margin:0 0 8px; font-size:13px">
-            <span style="color:#39c5bb">●</span> ${w.label}
-            <span class="mut" style="font-weight:400; margin-left:8px; font-size:11px">
-              <span class="${wPlCls}">${wPlS}</span> · ${wWR} · ${w.wins||0}W/${w.losses||0}L/${w.pending||0}P · we staked $${(w.total_staked_real||0).toFixed(2)} of leader's $${(w.leader_total_usdc||0).toFixed(2)}
-            </span>
-          </h3>
-          <table style="width:100%"><thead>
-            <tr><th>Time</th><th>Asset</th><th>Side</th><th>Leader $</th><th>Rungs</th><th>Filled</th><th>Real $</th><th>Result</th><th>Real P&amp;L</th><th>Slug</th></tr>
-          </thead><tbody></tbody></table>
-        `;
-        const tbody = sec.querySelector("tbody");
-        const sp = w.picks || [];
-        if (!sp.length) {
-          const tr = document.createElement("tr");
-          tr.innerHTML = `<td colspan="10" class="mut" style="padding:8px 4px">No signals yet from this wallet.</td>`;
-          tbody.appendChild(tr);
-        }
-        for (const p of sp) {
-          const t = new Date(p.ts*1000).toLocaleTimeString();
-          const sideCls = p.side==="YES" ? "ok" : "bad";
-          const sideArrow = p.side==="YES" ? "↑ UP" : "↓ DOWN";
-          const splS = (p.real_pl>=0?"+":"") + "$" + p.real_pl.toFixed(2);
-          const splCls = p.real_pl>0?"ok":p.real_pl<0?"bad":"mut";
-          const fillStr = p.rungs_count ? `${p.fills_count}/${p.rungs_count}` : "—";
-          const tr = document.createElement("tr");
-          tr.innerHTML = `<td class="mut">${t}</td><td>${p.asset}</td>
-            <td class="${sideCls}">${sideArrow}</td>
-            <td>$${(p.leader_stake||0).toFixed(2)}</td>
-            <td>${p.rungs_count}</td>
-            <td>${fillStr}</td>
-            <td>$${(p.real_stake||0).toFixed(2)}</td>
-            <td><span class="pill ${p.result}">${p.result}</span></td>
-            <td class="${splCls}">${splS}</td>
-            <td class="mut">${p.slug}</td>`;
-          tbody.appendChild(tr);
-        }
-        container.appendChild(sec);
-      }
     }
 
     for (const p of resolvedPicks) {
