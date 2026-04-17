@@ -168,6 +168,16 @@ async def evaluate_and_log(
         return
     last_sig[key] = fingerprint
 
+    # Half-Kelly sizing.
+    # For binary contract bought at price p with fair win-prob q (and fee
+    # already subtracted from edge), the Kelly-optimal fraction of bankroll
+    # is f* = edge / (1 - p). Half-Kelly = 0.5 * f* gives ~99% of geometric
+    # growth at half the variance.
+    kelly_full = edge / (1 - fill_ask) if fill_ask < 1 else 0.0
+    kelly_size = settings.bankroll_usdc * kelly_full * settings.kelly_fraction
+    size_usdc = max(market.min_size,
+                    min(fillable, settings.max_position_usdc, kelly_size))
+
     sig = {
         "ts": time.time(), "slug": market.slug, "asset": market.asset,
         "side": side,
@@ -182,8 +192,9 @@ async def evaluate_and_log(
         "fair_p": target_p, "edge": edge, "fee": fee,
         "z_score": z, "move_bps": move_bps, "sd_remaining_bps": sd_rem,
         "current": current_price, "opening": opening_price, "sec_left": sec_left,
-        "size_usdc": min(fillable, settings.max_position_usdc,
-                         settings.max_position_usdc * edge / 0.05),
+        "kelly_full_frac": kelly_full,
+        "kelly_size_uncapped": kelly_size,
+        "size_usdc": size_usdc,
     }
     PAPER_LOG.open("ab").write(orjson.dumps(sig) + b"\n")
     log.info("paper.signal", **sig)

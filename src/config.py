@@ -18,7 +18,12 @@ class Settings(BaseSettings):
 
     # Strategy
     edge_threshold: float = 0.025
-    max_position_usdc: float = 25.0
+    max_position_usdc: float = 25.0   # hard per-trade ceiling
+    bankroll_usdc: float = 100.0      # total allocated capital (Kelly base)
+    # Fractional Kelly multiplier. 0.5 = half-Kelly (industry standard:
+    # ~99% of geometric growth at ~half the variance of full-Kelly).
+    # Lower = safer / less aggressive sizing.
+    kelly_fraction: float = 0.5
     entry_window_start_sec: int = 45
     entry_window_end_sec: int = 5
 
