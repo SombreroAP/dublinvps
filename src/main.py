@@ -59,7 +59,7 @@ async def main() -> None:
         await asyncio.gather(
             cl_task,
             bn_task,
-            run_loop(chainlink, provider),
+            run_loop(chainlink, provider, binance=binance),
             run_book_logger(provider),
         )
 

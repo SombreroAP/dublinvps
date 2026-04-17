@@ -73,6 +73,7 @@ async def evaluate_and_log(
     opening_price: float,
     http: httpx.AsyncClient,
     last_sig: dict,
+    binance_price: float | None = None,
 ) -> None:
     """Evaluate a single market. If it passes the edge gate, re-fetch a LIVE
     CLOB book for the relevant side, then log with fresh prices."""
@@ -109,6 +110,15 @@ async def evaluate_and_log(
     # Require high model confidence. Data showed fair_p<0.85 wins ~25%.
     if target_p < settings.min_fair_p:
         return
+
+    # Cross-feed sanity check. If our Chainlink "current" diverges from
+    # Binance mid by too much, Chainlink is probably stale (this caused
+    # our SOL loss — Chainlink lagged a real crash by ~15s). Skip.
+    feed_div_bps = None
+    if binance_price is not None and settings.max_feed_divergence_bps > 0:
+        feed_div_bps = (current_price - binance_price) / binance_price * 10_000
+        if abs(feed_div_bps) > settings.max_feed_divergence_bps:
+            return
 
     # Cheap pre-filter: if cached ask is already way above fair, don't even
     # bother with the live refetch. Leave a small tolerance since fresh price
@@ -192,6 +202,8 @@ async def evaluate_and_log(
         "fair_p": target_p, "edge": edge, "fee": fee,
         "z_score": z, "move_bps": move_bps, "sd_remaining_bps": sd_rem,
         "current": current_price, "opening": opening_price, "sec_left": sec_left,
+        "binance_price": binance_price,
+        "feed_divergence_bps": feed_div_bps,
         "kelly_full_frac": kelly_full,
         "kelly_size_uncapped": kelly_size,
         "size_usdc": size_usdc,
@@ -200,7 +212,7 @@ async def evaluate_and_log(
     log.info("paper.signal", **sig)
 
 
-async def run_loop(feed, markets_provider) -> None:
+async def run_loop(feed, markets_provider, binance=None) -> None:
     last_status = 0.0
     last_sig: dict = {}
     async with httpx.AsyncClient() as http:
@@ -221,7 +233,8 @@ async def run_loop(feed, markets_provider) -> None:
                     opn = openings.get(m.slug)
                     if cur is None or opn is None:
                         continue
-                    tasks.append(evaluate_and_log(m, cur, opn, http, last_sig))
+                    bn = binance.last_price.get(m.asset) if binance is not None else None
+                    tasks.append(evaluate_and_log(m, cur, opn, http, last_sig, bn))
                 if tasks:
                     await asyncio.gather(*tasks, return_exceptions=True)
 

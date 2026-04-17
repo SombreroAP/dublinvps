@@ -56,6 +56,13 @@ class Settings(BaseSettings):
     # Change to "YES,NO" once/if NO performance improves.
     enabled_sides: str = "YES"
 
+    # Cross-feed sanity check. If our Chainlink "current" price diverges from
+    # Binance mid by more than this many bps, SKIP the signal — Chainlink is
+    # likely lagging during a fast move (we lost a SOL pick to exactly this:
+    # Binance was crashing at -4bps while Chainlink still showed +9bps).
+    # Set to 0 to disable.
+    max_feed_divergence_bps: float = 5.0
+
     # Mode
     mode: str = Field(default="paper", pattern="^(paper|live)$")
 
