@@ -602,7 +602,7 @@ tr:hover td { background:#192029; }
 <div class="card" style="margin:0 16px 16px; border-color:#2d4a2d">
   <h2 style="color:#3fb950">● Active round <span id="active_count" class="mut" style="font-weight:400"></span></h2>
   <table id="active_tbl"><thead>
-    <tr><th>Time</th><th>Asset</th><th>Target</th><th>Ask</th><th>Live ask</th><th>Fair p</th><th>Edge</th><th>Size</th><th>Open px</th><th>Live px</th><th>Δ</th><th>Slug</th></tr>
+    <tr><th>Date · Time</th><th>Asset</th><th>Target</th><th>Ask</th><th>Live ask</th><th>Fair p</th><th>Edge</th><th>Size</th><th>Open px</th><th>Live px</th><th>Δ</th><th>Slug</th></tr>
   </thead><tbody></tbody></table>
   <div id="active_empty" class="mut" style="padding:12px 4px; display:none">No picks in the currently-active round.</div>
 </div>
@@ -610,7 +610,7 @@ tr:hover td { background:#192029; }
 <div class="card" style="margin:0 16px 16px; border-color:#4a3d1a">
   <h2 style="color:#d29922">⏳ Waiting to resolve <span id="pending_count" class="mut" style="font-weight:400"></span></h2>
   <table id="pending_tbl"><thead>
-    <tr><th>Time</th><th>Asset</th><th>Target</th><th>Ask</th><th>Fair p</th><th>Edge</th><th>Size</th><th>Open px</th><th>Close px</th><th>Expected</th><th>Est P&amp;L</th><th>Slug</th></tr>
+    <tr><th>Date · Time</th><th>Asset</th><th>Target</th><th>Ask</th><th>Fair p</th><th>Edge</th><th>Size</th><th>Open px</th><th>Close px</th><th>Expected</th><th>Est P&amp;L</th><th>Slug</th></tr>
   </thead><tbody></tbody></table>
   <div id="pending_empty" class="mut" style="padding:12px 4px; display:none">No picks awaiting resolution.</div>
 </div>
@@ -618,7 +618,7 @@ tr:hover td { background:#192029; }
 <div class="card" style="margin:0 16px 16px">
   <h2>Recent resolved picks (sniper)</h2>
   <table id="picks_tbl"><thead>
-    <tr><th>Time</th><th>Asset</th><th>Target</th><th>Ask</th><th>Fair p</th><th>Edge</th><th>Size</th><th>Open px</th><th>Result</th><th>P&amp;L</th><th>Slug</th></tr>
+    <tr><th>Date · Time</th><th>Asset</th><th>Target</th><th>Ask</th><th>Fair p</th><th>Edge</th><th>Size</th><th>Open px</th><th>Result</th><th>P&amp;L</th><th>Slug</th></tr>
   </thead><tbody></tbody></table>
 </div>
 </div>
@@ -719,7 +719,8 @@ async function refresh() {
     document.getElementById("pending_empty").style.display = pendingPicks.length ? "none" : "block";
 
     for (const p of activePicks) {
-      const t = new Date(p.ts*1000).toLocaleTimeString();
+      const td = new Date(p.ts*1000);
+      const t = `${String(td.getMonth()+1).padStart(2,"0")}/${String(td.getDate()).padStart(2,"0")} ${td.toLocaleTimeString()}`;
       const tgtCls = p.target==="UP" ? "ok" : "bad";
       const tgtArrow = p.target==="UP" ? "↑" : "↓";
       let deltaCell = "—", deltaCls = "mut";
@@ -752,7 +753,8 @@ async function refresh() {
 
     // Pending resolution: round ended, just waiting on Polymarket to write the outcome.
     for (const p of pendingPicks) {
-      const t = new Date(p.ts*1000).toLocaleTimeString();
+      const td = new Date(p.ts*1000);
+      const t = `${String(td.getMonth()+1).padStart(2,"0")}/${String(td.getDate()).padStart(2,"0")} ${td.toLocaleTimeString()}`;
       const tgtCls = p.target==="UP" ? "ok" : "bad";
       const tgtArrow = p.target==="UP" ? "↑" : "↓";
       // Expected result + P&L based on Chainlink close vs open (our best
@@ -783,7 +785,8 @@ async function refresh() {
     }
 
     for (const p of resolvedPicks) {
-      const t = new Date(p.ts*1000).toLocaleTimeString();
+      const td = new Date(p.ts*1000);
+      const t = `${String(td.getMonth()+1).padStart(2,"0")}/${String(td.getDate()).padStart(2,"0")} ${td.toLocaleTimeString()}`;
       const plS = (p.pl>=0?"+":"") + "$" + p.pl.toFixed(2);
       const plCls = p.pl>0?"ok":p.pl<0?"bad":"mut";
       const tgtCls = p.target==="UP" ? "ok" : "bad";
