@@ -35,6 +35,16 @@ class Settings(BaseSettings):
     sigma_bps_eth: float = 1.2
     sigma_bps_sol: float = 1.5
 
+    # Safety multiplier applied to σ in fair_p. Accounts for crypto fat tails
+    # and mean reversion that Brownian model misses. 1.5 = 50% wider
+    # confidence intervals than pure-Gaussian realized vol implies.
+    sigma_safety_mult: float = 1.5
+
+    # Hard cap on fair_p (and symmetric floor 1 - cap for NO side). Prevents
+    # the model from claiming absurd confidence (0.99+) that tail events
+    # regularly violate. 0.95 ≈ our empirical win rate.
+    fair_p_cap: float = 0.95
+
     # Sanity filter: if our model disagrees with the market by more than this
     # (in probability points), SKIP the signal. Large disagreements usually
     # mean the market knows something (e.g. Chainlink/Binance divergence,

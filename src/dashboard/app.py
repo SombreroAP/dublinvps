@@ -364,18 +364,24 @@ def _simulate_fills(rungs: list, winning_token: str, trades: list[dict],
 
 def _fair_yes_p(asset: str, current: float, opening: float,
                 seconds_left: float) -> float:
-    """Mirror of strategy.sniper.fair_yes_probability (Brownian). Keep in sync."""
+    """Mirror of strategy.sniper.fair_yes_probability. Keep in sync:
+    Brownian + σ safety multiplier + [1-cap, cap] clamp."""
     from math import erf, sqrt
     sigma = {"BTC": settings.sigma_bps_btc, "ETH": settings.sigma_bps_eth,
              "SOL": settings.sigma_bps_sol}.get(asset, 1.2)
+    sigma *= settings.sigma_safety_mult
+    cap = settings.fair_p_cap
     if seconds_left <= 0:
-        return 1.0 if current >= opening else 0.0
-    move_bps = (current - opening) / opening * 10_000
-    sd = sigma * sqrt(seconds_left)
-    if sd < 1e-9:
-        return 1.0 if move_bps >= 0 else 0.0
-    z = move_bps / sd
-    return 0.5 * (1.0 + erf(z / sqrt(2)))
+        p = 1.0 if current >= opening else 0.0
+    else:
+        move_bps = (current - opening) / opening * 10_000
+        sd = sigma * sqrt(seconds_left)
+        if sd < 1e-9:
+            p = 1.0 if move_bps >= 0 else 0.0
+        else:
+            z = move_bps / sd
+            p = 0.5 * (1.0 + erf(z / sqrt(2)))
+    return max(1.0 - cap, min(cap, p))
 
 
 def _taker_fee(rate: float, exponent: float, price: float) -> float:

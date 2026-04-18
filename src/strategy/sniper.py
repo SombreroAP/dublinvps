@@ -36,15 +36,14 @@ def _phi(z: float) -> float:
 
 def compute_z(asset: str, current: float, opening: float,
               seconds_left: float) -> tuple[float, float, float]:
-    """Return (z_score, move_bps, sd_remaining_bps). z = move / σ·√(T-s).
-    z is in units of "how many standard deviations the move so far is vs the
-    expected volatility in the remaining time." Large |z| = move dominates
-    noise budget = likely to stick. Small |z| = move is within noise = fragile.
+    """Return (z_score, move_bps, sd_remaining_bps). z = move / (σ·mult·√(T-s)).
+    σ is inflated by SIGMA_SAFETY_MULT — this widens the noise budget so
+    marginal moves correctly look fragile instead of decisive.
     """
     if opening <= 0 or seconds_left <= 0:
         return 0.0, 0.0, 0.0
     move_bps = (current - opening) / opening * 10_000
-    sigma = _sigma_bps(asset)
+    sigma = _sigma_bps(asset) * settings.sigma_safety_mult
     sd_remaining_bps = sigma * sqrt(seconds_left)
     if sd_remaining_bps < 1e-9:
         return (float("inf") if move_bps > 0 else float("-inf") if move_bps < 0 else 0.0,
@@ -55,16 +54,26 @@ def compute_z(asset: str, current: float, opening: float,
 def fair_yes_probability(asset: str, current: float, opening: float,
                          seconds_left: float) -> float:
     """P(close ≥ open | current move so far, time remaining) under a zero-drift
-    Brownian model for log price. For a martingale, the probability that a
-    random walk ends above where it started, given current deviation x and
-    time-to-go (T-s), is Φ(x / (σ·√(T-s))).
+    Brownian model, with two crypto-specific adjustments:
+
+    1. σ inflated by SIGMA_SAFETY_MULT (handled in compute_z) — accounts for
+       fat tails and mean reversion the pure model misses.
+    2. Output clamped to [1-FAIR_P_CAP, FAIR_P_CAP] — the model never claims
+       confidence above our empirical win rate, preventing overconfident
+       entries on near-certain-looking trades that turn out to be fragile.
     """
     if seconds_left <= 0:
-        return 1.0 if current >= opening else 0.0
-    z, _, sd = compute_z(asset, current, opening, seconds_left)
-    if sd < 1e-9:
-        return 1.0 if current >= opening else 0.0
-    return _phi(z)
+        # At expiry, outcome is known; still clamp so evaluate() uses
+        # consistent threshold logic for the "edge" calculation.
+        p = 1.0 if current >= opening else 0.0
+    else:
+        z, _, sd = compute_z(asset, current, opening, seconds_left)
+        if sd < 1e-9:
+            p = 1.0 if current >= opening else 0.0
+        else:
+            p = _phi(z)
+    cap = settings.fair_p_cap
+    return max(1.0 - cap, min(cap, p))
 
 
 async def evaluate_and_log(
