@@ -83,6 +83,7 @@ async def evaluate_and_log(
     http: httpx.AsyncClient,
     last_sig: dict,
     binance_price: float | None = None,
+    velocity_bps_per_sec: float | None = None,
 ) -> None:
     """Evaluate a single market. If it passes the edge gate, re-fetch a LIVE
     CLOB book for the relevant side, then log with fresh prices."""
@@ -128,6 +129,22 @@ async def evaluate_and_log(
         feed_div_bps = (current_price - binance_price) / binance_price * 10_000
         if abs(feed_div_bps) > settings.max_feed_divergence_bps:
             return
+
+    # Trajectory filter: if momentum is strongly against our bet direction,
+    # the move we're betting on is likely reversing. Hypothesis from loss
+    # analysis: many losses had positive move_bps but price was ALREADY
+    # turning at entry time. Skip these.
+    v = velocity_bps_per_sec
+    v_aligned: bool | None = None
+    if v is not None:
+        want_up = (side == "YES")
+        v_aligned = (want_up and v >= 0) or (not want_up and v <= 0)
+        threshold = settings.max_counter_trajectory_bps_per_sec
+        if threshold > 0:
+            if want_up and v < -threshold:
+                return
+            if (not want_up) and v > threshold:
+                return
 
     # Cheap pre-filter: if cached ask is already way above fair, don't even
     # bother with the live refetch. Leave a small tolerance since fresh price
@@ -213,6 +230,8 @@ async def evaluate_and_log(
         "current": current_price, "opening": opening_price, "sec_left": sec_left,
         "binance_price": binance_price,
         "feed_divergence_bps": feed_div_bps,
+        "velocity_bps_per_sec": v,
+        "velocity_aligned": v_aligned,
         "kelly_full_frac": kelly_full,
         "kelly_size_uncapped": kelly_size,
         "size_usdc": size_usdc,
@@ -243,7 +262,12 @@ async def run_loop(feed, markets_provider, binance=None) -> None:
                     if cur is None or opn is None:
                         continue
                     bn = binance.last_price.get(m.asset) if binance is not None else None
-                    tasks.append(evaluate_and_log(m, cur, opn, http, last_sig, bn))
+                    # Trajectory: recent velocity of the Chainlink price feed.
+                    v = None
+                    if hasattr(feed, "velocity_bps_per_sec"):
+                        v = feed.velocity_bps_per_sec(
+                            m.asset, settings.trajectory_lookback_sec)
+                    tasks.append(evaluate_and_log(m, cur, opn, http, last_sig, bn, v))
                 if tasks:
                     await asyncio.gather(*tasks, return_exceptions=True)
 

@@ -60,6 +60,36 @@ class ChainlinkFeed:
                 return val
         return None
 
+    def velocity_bps_per_sec(self, asset: str, lookback_sec: float = 5.0
+                              ) -> float | None:
+        """Rate of price change over the last `lookback_sec`, in bps/sec.
+        Positive = rising, negative = falling. None if not enough history.
+
+        Uses first observation ≥ (now - lookback_sec) as the reference point.
+        That way it's robust to uneven Chainlink cadence.
+        """
+        hist = self._history.get(asset)
+        if not hist or len(hist) < 2:
+            return None
+        now_ms = hist[-1][0]
+        current_val = hist[-1][1]
+        cutoff_ms = now_ms - int(lookback_sec * 1000)
+        ref_ts_ms = None
+        ref_val = None
+        # Walk from oldest → newest, pick first sample at/after cutoff.
+        for ts_ms, val in hist:
+            if ts_ms >= cutoff_ms:
+                ref_ts_ms = ts_ms
+                ref_val = val
+                break
+        if ref_ts_ms is None or ref_val is None or ref_val <= 0:
+            return None
+        dt_sec = (now_ms - ref_ts_ms) / 1000.0
+        if dt_sec <= 0:
+            return None
+        # (current - ref) / ref * 10000 = move in bps; / dt = bps/sec.
+        return (current_val - ref_val) / ref_val * 10_000 / dt_sec
+
     async def _pinger(self, ws: "websockets.WebSocketClientProtocol") -> None:
         while True:
             await asyncio.sleep(PING_INTERVAL_SEC)

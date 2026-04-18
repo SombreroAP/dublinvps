@@ -485,12 +485,14 @@ def _compute_live_state() -> list[dict]:
 
         delta = (cur - opening) if (cur is not None and opening is not None) else None
         move_bps = ((cur - opening) / opening * 10_000) if delta is not None else None
+        velocity = _chainlink.velocity_bps_per_sec(asset, settings.trajectory_lookback_sec)
 
         out.append({
             "asset": asset, "slug": slug,
             "round_start": round_start, "round_end": round_end,
             "round_end_unix_ts": round_end,  # for client-side countdown
             "seconds_left": sec_left,
+            "velocity_bps_per_sec": velocity,
             "opening": opening, "current": cur, "delta": delta, "move_bps": move_bps,
             "yes_ask": yes_ask, "no_ask": no_ask,
             "fair_p_yes": fair_p,
@@ -676,6 +678,7 @@ function renderAssetCards() {
       <div class="kv"><span class="k">Open px</span><span class="v">${fmtPxJS(s.opening, s.asset)}</span></div>
       <div class="kv"><span class="k">Live px</span><span class="v ${liveCls}">${fmtPxJS(s.current, s.asset)}</span></div>
       <div class="kv"><span class="k">Move</span><span class="v ${dirCls}">${moveStr}</span></div>
+      <div class="kv"><span class="k">Velocity (5s)</span><span class="v ${s.velocity_bps_per_sec==null?"mut":(s.velocity_bps_per_sec>0?"ok":s.velocity_bps_per_sec<0?"bad":"mut")}">${s.velocity_bps_per_sec==null?"—":((s.velocity_bps_per_sec>=0?"+":"")+s.velocity_bps_per_sec.toFixed(2)+" bps/s")}</span></div>
       <div class="kv"><span class="k">YES ask / NO ask</span><span class="v">${s.yes_ask==null?"—":s.yes_ask.toFixed(2)} / ${s.no_ask==null?"—":s.no_ask.toFixed(2)}</span></div>
       <div class="kv"><span class="k">Fair p (YES)</span><span class="v">${s.fair_p_yes==null?"—":s.fair_p_yes.toFixed(2)}</span></div>
       <div class="kv"><span class="k">Best edge</span><span class="v">${edgeStr}</span></div>

@@ -73,6 +73,14 @@ class Settings(BaseSettings):
     # Set to 0 to disable.
     max_feed_divergence_bps: float = 5.0
 
+    # Trajectory / momentum filter.
+    # Lookback window (seconds) for computing recent price velocity.
+    trajectory_lookback_sec: float = 5.0
+    # If we want to bet UP but price is falling faster than this (bps/sec),
+    # skip — momentum is against us, move is likely reversing. Symmetric for
+    # DOWN bets. Set to 0 to disable filter (but still log velocity).
+    max_counter_trajectory_bps_per_sec: float = 0.5
+
     # Mode
     mode: str = Field(default="paper", pattern="^(paper|live)$")
 
