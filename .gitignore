@@ -11,3 +11,4 @@ __pycache__/
 logs/
 *.log
 paper_trades.jsonl
+.claude/worktrees/
