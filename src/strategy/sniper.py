@@ -82,6 +82,7 @@ async def evaluate_and_log(
     opening_price: float,
     http: httpx.AsyncClient,
     last_sig: dict,
+    round_fired: set,
     binance_price: float | None = None,
     velocity_bps_per_sec: float | None = None,
 ) -> None:
@@ -196,13 +197,26 @@ async def evaluate_and_log(
     if edge > 0.30:
         return
 
+    # Correlation cap: BTC/ETH/SOL move together on 5m windows. If we've
+    # already fired for this round on any asset, skip — avoids 3-asset
+    # correlated losses (biggest historical risk, 14:1 loss/win asymmetry).
+    # Allow repeat fires for the SAME (slug, side) so dedup fingerprint can
+    # still update an existing pick with better fill_ask.
+    round_start = market.end_ts - 300  # 5m markets
     key = (market.slug, side)
+    already_seen_same = key in last_sig
+    if (settings.max_picks_per_round > 0
+            and round_start in round_fired
+            and not already_seen_same):
+        return
+
     # Tighter dedup: fingerprint on fill_ask rounded to 2dp + fair_p to 2dp.
     # Small orderbook wobbles no longer trigger new log lines.
     fingerprint = (round(fill_ask, 2), round(target_p, 2))
     if last_sig.get(key) == fingerprint:
         return
     last_sig[key] = fingerprint
+    round_fired.add(round_start)
 
     # Half-Kelly sizing.
     # For binary contract bought at price p with fair win-prob q (and fee
@@ -235,6 +249,7 @@ async def evaluate_and_log(
         "kelly_full_frac": kelly_full,
         "kelly_size_uncapped": kelly_size,
         "size_usdc": size_usdc,
+        "round_start": round_start,
     }
     PAPER_LOG.open("ab").write(orjson.dumps(sig) + b"\n")
     log.info("paper.signal", **sig)
@@ -243,15 +258,19 @@ async def evaluate_and_log(
 async def run_loop(feed, markets_provider, binance=None) -> None:
     last_status = 0.0
     last_sig: dict = {}
+    round_fired: set[int] = set()
     async with httpx.AsyncClient() as http:
         while True:
             try:
                 markets, openings = await markets_provider()
                 now = time.time()
                 live_slugs = {m.slug for m in markets}
+                live_rounds = {m.end_ts - 300 for m in markets}
                 for k in list(last_sig):
                     if k[0] not in live_slugs:
                         last_sig.pop(k, None)
+                # Drop expired rounds so the set doesn't grow forever.
+                round_fired.intersection_update(live_rounds)
 
                 # Evaluate all markets concurrently — lets live refetches run
                 # in parallel so we don't serialize 9+ HTTP calls.
@@ -267,7 +286,8 @@ async def run_loop(feed, markets_provider, binance=None) -> None:
                     if hasattr(feed, "velocity_bps_per_sec"):
                         v = feed.velocity_bps_per_sec(
                             m.asset, settings.trajectory_lookback_sec)
-                    tasks.append(evaluate_and_log(m, cur, opn, http, last_sig, bn, v))
+                    tasks.append(evaluate_and_log(
+                        m, cur, opn, http, last_sig, round_fired, bn, v))
                 if tasks:
                     await asyncio.gather(*tasks, return_exceptions=True)
 

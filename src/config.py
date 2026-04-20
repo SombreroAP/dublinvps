@@ -81,6 +81,13 @@ class Settings(BaseSettings):
     # DOWN bets. Set to 0 to disable filter (but still log velocity).
     max_counter_trajectory_bps_per_sec: float = 0.5
 
+    # Correlation cap. BTC/ETH/SOL on 5m windows are ~95% correlated; when
+    # one's wrong they all tend to be wrong. A 3-asset correlated loss wipes
+    # ~2-3 weeks of tiny wins given our 14:1 loss/win ratio. Cap = max picks
+    # per round across ALL assets. 1 = diversified in time, not in assets.
+    # 0 disables (revert to per-asset behavior).
+    max_picks_per_round: int = 1
+
     # Mode
     mode: str = Field(default="paper", pattern="^(paper|live)$")
 
