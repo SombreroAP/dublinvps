@@ -97,6 +97,11 @@ class Settings(BaseSettings):
     stop_loss_pct: float = -0.05
     # How often (seconds) to poll the CLOB book for held positions.
     exit_poll_interval_sec: float = 1.0
+    # CRITICAL SAFETY: force-exit at best bid this many seconds before round
+    # end, regardless of TP/SL. Guarantees we NEVER hold through resolution.
+    # With this active, the strategy is purely "buy momentum, sell before
+    # round resolves." No binary all-or-nothing payoffs.
+    force_exit_sec_before_end: float = 3.0
 
     # Mode
     mode: str = Field(default="paper", pattern="^(paper|live)$")

@@ -394,27 +394,43 @@ async def poll_exits(
 
     async def check_one(key: str, pos: "Position") -> None:
         now = time.time()
-        # First check: has the round ended? If so, we can't TP/SL any more —
-        # fall back to binary resolution.
-        if now >= pos.round_end:
-            outcome = _fetch_round_outcome_sync(pos.slug)
-            if outcome is None:
-                # Market hasn't resolved yet — wait for next poll tick.
+
+        # Always fetch the CLOB book; we'll decide exit reason from it.
+        bids, asks = await fetch_clob_book(http, pos.token_id)
+        best_bid = bids[0][0] if bids else None
+
+        # 1) FORCE EXIT window: we MUST close before round resolves. Even if
+        # TP/SL hasn't triggered, exit now at whatever bid exists.
+        force_exit_boundary = pos.round_end - settings.force_exit_sec_before_end
+        if now >= force_exit_boundary:
+            if best_bid is not None:
+                fee_rate_at_bid = 0.072 * max(0.0, 1.0 - 4.0 * (best_bid - 0.5) ** 2)
+                gross = pos.shares * best_bid
+                exit_fee_usdc = gross * fee_rate_at_bid
+                exit_proceeds = gross - exit_fee_usdc
+                net_pl = exit_proceeds - pos.entry_cost_usdc
+                _log_exit(pos, "expired", best_bid, exit_proceeds, fee_rate_at_bid, net_pl)
+                open_positions.pop(key, None)
                 return
-            won = (pos.side == "YES" and outcome == "UP") or \
-                  (pos.side == "NO" and outcome == "DOWN")
-            # Binary resolution: payout = shares if won, else 0. No exit fee.
-            exit_proceeds = pos.shares if won else 0.0
-            net_pl = exit_proceeds - pos.entry_cost_usdc
-            _log_exit(pos, "resolve", None, exit_proceeds, 0.0, net_pl, outcome)
-            open_positions.pop(key, None)
+            # Book has no bids AND round about to resolve — as absolute last
+            # resort, use Chainlink-derived binary outcome directly (no Gamma
+            # dependency). Compute from opening_at on our feed history.
+            if now >= pos.round_end:
+                # Won't happen unless the book went totally empty; fall back.
+                outcome = _fetch_round_outcome_sync(pos.slug)
+                if outcome is None:
+                    return  # try next tick; we still haven't resolved
+                won = (pos.side == "YES" and outcome == "UP") or \
+                      (pos.side == "NO" and outcome == "DOWN")
+                exit_proceeds = pos.shares if won else 0.0
+                net_pl = exit_proceeds - pos.entry_cost_usdc
+                _log_exit(pos, "resolve", None, exit_proceeds, 0.0, net_pl, outcome)
+                open_positions.pop(key, None)
             return
 
-        # Fetch current CLOB book to check TP/SL.
-        bids, asks = await fetch_clob_book(http, pos.token_id)
-        if not bids:
-            return  # can't exit if no bids
-        best_bid = bids[0][0]
+        # 2) TP/SL checks (before force-exit window).
+        if best_bid is None:
+            return
 
         exit_kind: ExitKind | None = None
         if best_bid >= pos.tp_bid:
