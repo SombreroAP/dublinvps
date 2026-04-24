@@ -220,6 +220,12 @@ async def evaluate_and_log(
         return
     if fillable < 0.8 * desired_size:
         return
+    # TP-reachability filter: skip if ask is already so high that TP has no
+    # real room (or so low that SL is meaningless).
+    if fill_ask > settings.max_entry_ask:
+        return
+    if fill_ask < settings.min_entry_ask:
+        return
     # Market's implied probability for OUR side. Use mid if we have both,
     # else fall back to best_ask.
     market_implied = ((best_bid + best_ask) / 2) if (best_bid is not None) else best_ask

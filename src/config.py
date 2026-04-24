@@ -103,6 +103,15 @@ class Settings(BaseSettings):
     # round resolves." No binary all-or-nothing payoffs.
     force_exit_sec_before_end: float = 3.0
 
+    # TP-reachability filter: entry ask must leave enough headroom for TP
+    # to actually be hit. max_entry_ask = 1 / (1 + tp_pct) - safety_margin.
+    # With tp_pct=0.10, mathematical ceiling is 0.909. Use 0.85 for safety
+    # margin + fees. Prevents firing on asks where TP is auto-clamped flat.
+    max_entry_ask: float = 0.85
+    # Analogous floor: below this, the short side (NO) is probably dust
+    # and SL wouldn't provide meaningful protection.
+    min_entry_ask: float = 0.15
+
     # Mode
     mode: str = Field(default="paper", pattern="^(paper|live)$")
 
