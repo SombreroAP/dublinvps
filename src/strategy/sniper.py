@@ -412,14 +412,19 @@ async def poll_exits(
                 _log_exit(pos, "expired", best_bid, exit_proceeds, fee_rate_at_bid, net_pl)
                 open_positions.pop(key, None)
                 return
-            # Book has no bids AND round about to resolve — as absolute last
-            # resort, use Chainlink-derived binary outcome directly (no Gamma
-            # dependency). Compute from opening_at on our feed history.
+            # Book has no bids AND round about to resolve. Try Gamma.
             if now >= pos.round_end:
-                # Won't happen unless the book went totally empty; fall back.
                 outcome = _fetch_round_outcome_sync(pos.slug)
                 if outcome is None:
-                    return  # try next tick; we still haven't resolved
+                    # FAILSAFE: if we've been stuck >60s past round end,
+                    # force-pop with zero proceeds. Better to log a loss
+                    # than infinite-loop on a dead position (seen with
+                    # 404 on CLOB for resolved markets).
+                    if now > pos.round_end + 60:
+                        _log_exit(pos, "expired", None, 0.0, 0.0,
+                                  -pos.entry_cost_usdc)
+                        open_positions.pop(key, None)
+                    return
                 won = (pos.side == "YES" and outcome == "UP") or \
                       (pos.side == "NO" and outcome == "DOWN")
                 exit_proceeds = pos.shares if won else 0.0
