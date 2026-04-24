@@ -169,8 +169,17 @@ def _compute_backtest() -> dict:
 
     rows = _read_signals()
     post = [r for r in rows if r["ts"] >= CHAINLINK_CUTOFF]
+
+    # Split by format. New format has event=entry|exit_*; legacy has no event.
+    legacy = [r for r in post if "event" not in r]
+    active_entries = [r for r in post if r.get("event") == "entry"]
+    active_exits = [r for r in post
+                    if str(r.get("event", "")).startswith("exit_")]
+    exits_by_pid = {r["position_id"]: r for r in active_exits}
+
+    # Legacy dedup (best edge per slug/side).
     best: dict = {}
-    for r in post:
+    for r in legacy:
         k = (r["slug"], r["side"])
         if k not in best or r["edge"] > best[k]["edge"]:
             best[k] = r
@@ -178,6 +187,78 @@ def _compute_backtest() -> dict:
     picks = []
     tot_pl = 0.0
     wins = losses = pending = 0
+
+    # ---- Active positions (new format) ----
+    for entry in sorted(active_entries, key=lambda r: r["ts"], reverse=True):
+        pid = entry["position_id"]
+        ex = exits_by_pid.get(pid)
+        slug = entry["slug"]
+        side = entry["side"]
+        target = "UP" if side == "YES" else "DOWN"
+        asset = entry["asset"]
+        open_px = entry.get("opening")
+        round_end_ts = entry.get("round_end")
+        if ex is None:
+            # Still open (either active round or waiting for exit decision).
+            phase = "active" if (round_end_ts and round_end_ts > time.time()) \
+                              else "pending"
+            status_ = "open"
+            pl = 0.0
+            pending += 1
+            exit_kind = None
+            hold_sec = None
+        else:
+            kind = ex["event"].split("_", 1)[1]  # tp / sl / resolve / expired
+            pl = float(ex["net_pl_usdc"])
+            hold_sec = ex.get("hold_sec")
+            exit_kind = kind
+            if pl > 0:
+                wins += 1
+                status_ = f"WIN"
+            elif pl < 0:
+                losses += 1
+                status_ = f"LOSS"
+            else:
+                status_ = "BREAK"
+            phase = "closed"
+        tot_pl += pl
+
+        # Live px + ask only meaningful while active.
+        if phase == "active":
+            live = _chainlink.last_price.get(asset)
+            live_ask = _fetch_live_ask(slug, side)
+        elif phase == "pending":
+            live = _chainlink.opening_at(asset, round_end_ts) if round_end_ts \
+                   else None
+            live_ask = None
+        else:
+            live = None
+            live_ask = None
+        delta = (live - open_px) if (live is not None and open_px is not None) \
+                else None
+        if delta is None:
+            trending = None
+        else:
+            trending = (target == "UP" and delta > 0) or (target == "DOWN" and delta < 0)
+
+        picks.append({
+            "ts": entry["ts"], "slug": slug, "asset": asset, "side": side,
+            "target": target,
+            "ask": entry["ask"], "fair_p": entry["fair_p"],
+            "edge": entry["edge"], "fee": entry["fee"],
+            "size_usdc": entry["size_usdc"],
+            "opening": open_px, "live": live, "delta": delta,
+            "live_ask": live_ask, "trending": trending, "phase": phase,
+            "expected_result": None, "expected_pl": None,
+            "result": status_, "pl": pl,
+            "active": True,
+            "exit_kind": exit_kind,
+            "hold_sec": hold_sec,
+            "tp_bid": entry.get("tp_bid"),
+            "sl_bid": entry.get("sl_bid"),
+        })
+
+    # ---- Legacy signals (resolved via Gamma) ----
     for (slug, side), r in sorted(best.items(), key=lambda kv: kv[1]["ts"], reverse=True):
         res = _fetch_resolution(slug)
         if res in ("UP", "DOWN"):
@@ -248,15 +329,35 @@ def _compute_backtest() -> dict:
             "live_ask": live_ask, "trending": trending, "phase": phase,
             "expected_result": expected_result, "expected_pl": expected_pl,
             "result": status_, "pl": pl,
+            "active": False,
+            "exit_kind": None,
+            "hold_sec": None,
+            "tp_bid": None,
+            "sl_bid": None,
         })
+
+    # Keep picks sorted by ts DESC (newest first) across both sources.
+    picks.sort(key=lambda p: p["ts"], reverse=True)
+
+    # Stats broken out by format so user can see if active strategy is
+    # outperforming legacy.
+    active_closed_pls = [p["pl"] for p in picks if p["active"] and p["result"] in ("WIN","LOSS","BREAK")]
+    active_wins = sum(1 for p in picks if p["active"] and p["result"]=="WIN")
+    active_losses = sum(1 for p in picks if p["active"] and p["result"]=="LOSS")
 
     result = {
         "total_signals": len(rows),
         "post_chainlink_signals": len(post),
-        "unique_picks": len(best),
+        "unique_picks": len(best) + len(active_entries),
         "wins": wins, "losses": losses, "pending": pending,
         "win_rate": (wins / (wins + losses)) if (wins + losses) else None,
         "total_pl": tot_pl,
+        "active_stats": {
+            "trades": len(active_closed_pls),
+            "wins": active_wins,
+            "losses": active_losses,
+            "pl": sum(active_closed_pls),
+        },
         "picks": picks[:50],
     }
     _backtest_cache = (time.time(), result)
@@ -592,6 +693,7 @@ tr:hover td { background:#192029; }
 <div class="wrap">
 <div class="grid">
   <div class="card"><h2>P&amp;L (simulated)</h2><div id="pl" class="big">—</div><div id="plsub" class="mut"></div></div>
+  <div class="card"><h2>Active strategy P&amp;L</h2><div id="active_pl" class="big">—</div><div id="active_pl_sub" class="mut"></div></div>
   <div class="card"><h2>Win rate</h2><div id="winrate" class="big">—</div><div id="wr_sub" class="mut"></div></div>
   <div class="card"><h2>Unique picks</h2><div id="picks" class="big">—</div><div id="picks_sub" class="mut"></div></div>
   <div class="card"><h2>Chainlink prices</h2>
@@ -626,7 +728,7 @@ tr:hover td { background:#192029; }
 <div class="card" style="margin:0 16px 16px">
   <h2>Recent resolved picks (sniper)</h2>
   <table id="picks_tbl"><thead>
-    <tr><th>Date · Time</th><th>Asset</th><th>Target</th><th>Ask</th><th>Fair p</th><th>Edge</th><th>Size</th><th>Open px</th><th>Result</th><th>P&amp;L</th><th>Slug</th></tr>
+    <tr><th>Date · Time</th><th>Asset</th><th>Target</th><th>Ask</th><th>Fair p</th><th>Edge</th><th>Size</th><th>Open px</th><th>Result</th><th>P&amp;L</th><th>Hold</th><th>Slug</th></tr>
   </thead><tbody></tbody></table>
 </div>
 </div>
@@ -698,6 +800,17 @@ async function refresh() {
     plEl.textContent = (pl>=0?"+":"") + "$" + pl.toFixed(2);
     plEl.className = "big " + (pl>0?"ok":pl<0?"bad":"mut");
     document.getElementById("plsub").textContent = `over ${bt.wins+bt.losses} resolved trades`;
+
+    // Active strategy only
+    const active = bt.active_stats || {trades:0, wins:0, losses:0, pl:0};
+    const aplEl = document.getElementById("active_pl");
+    aplEl.textContent = active.trades === 0 ? "—" :
+      (active.pl>=0?"+":"") + "$" + active.pl.toFixed(2);
+    aplEl.className = "big " + (active.pl>0?"ok":active.pl<0?"bad":"mut");
+    document.getElementById("active_pl_sub").textContent =
+      active.trades === 0 ? "no active trades yet" :
+      `${active.wins}W / ${active.losses}L from ${active.trades} closed`;
+
     document.getElementById("winrate").textContent = bt.win_rate==null ? "—" : (bt.win_rate*100).toFixed(1)+"%";
     document.getElementById("wr_sub").textContent = `${bt.wins}W / ${bt.losses}L / ${bt.pending}P`;
     document.getElementById("picks").textContent = bt.unique_picks;
@@ -800,6 +913,9 @@ async function refresh() {
       const plCls = p.pl>0?"ok":p.pl<0?"bad":"mut";
       const tgtCls = p.target==="UP" ? "ok" : "bad";
       const tgtArrow = p.target==="UP" ? "↑" : "↓";
+      // Show exit kind badge for active-strategy closures (tp/sl/resolve/expired).
+      const kindBadge = p.exit_kind ? ` <span class="mut" style="font-size:10px">(${p.exit_kind})</span>` : "";
+      const holdStr = p.hold_sec != null ? `${p.hold_sec.toFixed(0)}s` : "—";
       const tr = document.createElement("tr");
       tr.innerHTML = `<td class="mut">${t}</td><td>${p.asset}</td>
         <td class="${tgtCls}">${tgtArrow} ${p.target}</td>
@@ -808,8 +924,10 @@ async function refresh() {
         <td>${(p.edge*100).toFixed(1)}%</td>
         <td>$${p.size_usdc.toFixed(0)}</td>
         <td>${fmtPx(p.opening, p.asset)}</td>
-        <td><span class="pill ${p.result}">${p.result}</span></td>
-        <td class="${plCls}">${plS}</td><td class="mut">${p.slug}</td>`;
+        <td><span class="pill ${p.result}">${p.result}</span>${kindBadge}</td>
+        <td class="${plCls}">${plS}</td>
+        <td class="mut" style="font-size:10px">${holdStr}</td>
+        <td class="mut">${p.slug}</td>`;
       resBody.appendChild(tr);
     }
 

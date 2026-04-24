@@ -1,15 +1,26 @@
 """Edge calculation + paper-trade signal logger.
 
-IMPORTANT: bids/asks on the Market object from the discovery refresh can be
-up to GAMMA_TTL seconds stale. Before logging a signal we re-fetch the CLOB
-book live, so the logged ask is what a real order would actually hit.
+ACTIVE EXIT MANAGEMENT strategy:
+- Entry: same as before (z-score, edge, velocity, etc. — all filter gates).
+- Held as a Position until:
+    * CLOB bid reaches entry_ask × (1 + TAKE_PROFIT_PCT) → sell, book profit
+    * CLOB bid falls to entry_ask × (1 + STOP_LOSS_PCT)  → sell, cut loss
+    * Round ends without either → fall back to binary resolution (win $1 or $0)
+
+Paper log is append-only JSONL with two event types sharing `position_id`:
+    entry:        when we open (single line per opened position)
+    exit_<kind>:  when we close (tp / sl / resolve / expired)
+Backtest pairs them by position_id to compute full round-trip P&L.
 """
 from __future__ import annotations
 
 import asyncio
+import subprocess
 import time
+from dataclasses import dataclass, field
 from math import erf, sqrt
 from pathlib import Path
+from typing import Literal
 
 import httpx
 import orjson
@@ -19,6 +30,33 @@ from src.logging_setup import log
 from src.polymarket.gamma import Market, fetch_clob_book, sweep_fill_ask
 
 PAPER_LOG = Path("paper_trades.jsonl")
+
+
+ExitKind = Literal["tp", "sl", "resolve", "expired"]
+
+
+@dataclass
+class Position:
+    """An open paper position we're actively managing for TP/SL/resolution."""
+    position_id: str           # slug + side + entry_ts_ms
+    slug: str
+    asset: str
+    side: str                  # YES or NO
+    token_id: str              # CLOB token id for the bought side
+    entry_ts: float
+    round_start: int
+    round_end: int
+    entry_ask: float           # VWAP we "paid" (includes fee already in cost)
+    entry_fee: float           # fraction of notional
+    size_usdc: float           # notional staked
+    shares: float              # size_usdc / entry_ask
+    tp_bid: float              # bid threshold to sell at take profit
+    sl_bid: float              # bid threshold to sell at stop loss
+
+    @property
+    def entry_cost_usdc(self) -> float:
+        """What leaving entry cost us: stake + taker fee."""
+        return self.size_usdc + (self.size_usdc * self.entry_fee)
 
 
 def _sigma_bps(asset: str) -> float:
@@ -83,6 +121,7 @@ async def evaluate_and_log(
     http: httpx.AsyncClient,
     last_sig: dict,
     round_fired: set,
+    open_positions: dict,
     binance_price: float | None = None,
     velocity_bps_per_sec: float | None = None,
 ) -> None:
@@ -228,13 +267,47 @@ async def evaluate_and_log(
     size_usdc = max(market.min_size,
                     min(fillable, settings.max_position_usdc, kelly_size))
 
-    sig = {
-        "ts": time.time(), "slug": market.slug, "asset": market.asset,
+    # Don't open a new position if we already hold one for this (slug, side).
+    position_key = f"{market.slug}:{side}"
+    if position_key in open_positions:
+        return
+
+    # Compute TP/SL bid thresholds. Buying at fill_ask → we'll sell at some bid.
+    # TP: entry_ask × (1 + tp_pct). E.g. 0.80 → 0.88 (10% gain).
+    # SL: entry_ask × (1 + sl_pct). E.g. 0.80 → 0.76 (5% loss cap, assumes sl_pct < 0).
+    # Bids are naturally ≤ ask so TP requires the market to LIFT past our entry.
+    tp_bid = min(0.99, fill_ask * (1.0 + settings.take_profit_pct))
+    sl_bid = max(0.01, fill_ask * (1.0 + settings.stop_loss_pct))
+    shares = size_usdc / fill_ask if fill_ask > 0 else 0.0
+
+    now_ts = time.time()
+    position_id = f"{market.slug}:{side}:{int(now_ts * 1000)}"
+    position = Position(
+        position_id=position_id,
+        slug=market.slug,
+        asset=market.asset,
+        side=side,
+        token_id=token_id,
+        entry_ts=now_ts,
+        round_start=round_start,
+        round_end=market.end_ts,
+        entry_ask=fill_ask,
+        entry_fee=fee,
+        size_usdc=size_usdc,
+        shares=shares,
+        tp_bid=tp_bid,
+        sl_bid=sl_bid,
+    )
+    open_positions[position_key] = position
+
+    entry = {
+        "event": "entry",
+        "position_id": position_id,
+        "ts": now_ts, "slug": market.slug, "asset": market.asset,
         "side": side,
-        "ask": fill_ask,                       # VWAP we'd actually pay
-        "best_ask": best_ask,                  # top-of-book reference
-        "best_bid": best_bid,
-        "market_implied_p": market_implied,    # (bid+ask)/2 of our side
+        "ask": fill_ask,
+        "best_ask": best_ask, "best_bid": best_bid,
+        "market_implied_p": market_implied,
         "disagreement": disagreement,
         "cached_ask_at_discovery": cached_ask,
         "fillable_usdc": fillable,
@@ -249,16 +322,133 @@ async def evaluate_and_log(
         "kelly_full_frac": kelly_full,
         "kelly_size_uncapped": kelly_size,
         "size_usdc": size_usdc,
+        "shares": shares,
+        "tp_bid": tp_bid,
+        "sl_bid": sl_bid,
         "round_start": round_start,
+        "round_end": market.end_ts,
     }
-    PAPER_LOG.open("ab").write(orjson.dumps(sig) + b"\n")
-    log.info("paper.signal", **sig)
+    PAPER_LOG.open("ab").write(orjson.dumps(entry) + b"\n")
+    log.info("paper.entry", **entry)
+
+
+def _fetch_round_outcome_sync(slug: str) -> str | None:
+    """Return 'UP' / 'DOWN' / None (not yet resolved / error).
+    Uses curl because httpx in-process can hit Cloudflare TLS fingerprint issues
+    during heavy concurrent polling of CLOB."""
+    try:
+        raw = subprocess.check_output([
+            "curl", "-s", "-H", "User-Agent: Mozilla/5.0",
+            f"https://gamma-api.polymarket.com/events?slug={slug}",
+        ], timeout=4)
+        d = orjson.loads(raw)
+        if not d:
+            return None
+        m = (d[0].get("markets") or [{}])[0]
+        if not m.get("closed"):
+            return None
+        op = orjson.loads(m.get("outcomePrices") or "[]")
+        if op == ["1", "0"]:
+            return "UP"
+        if op == ["0", "1"]:
+            return "DOWN"
+    except Exception:
+        return None
+    return None
+
+
+def _log_exit(position: "Position", kind: ExitKind, exit_bid: float | None,
+              exit_proceeds: float, exit_fee: float, net_pl: float,
+              outcome: str | None = None) -> None:
+    exit_event = {
+        "event": f"exit_{kind}",
+        "position_id": position.position_id,
+        "ts": time.time(),
+        "entry_ts": position.entry_ts,
+        "slug": position.slug,
+        "asset": position.asset,
+        "side": position.side,
+        "entry_ask": position.entry_ask,
+        "size_usdc": position.size_usdc,
+        "shares": position.shares,
+        "exit_bid": exit_bid,
+        "exit_proceeds_usdc": exit_proceeds,
+        "exit_fee": exit_fee,
+        "entry_cost_usdc": position.entry_cost_usdc,
+        "net_pl_usdc": net_pl,
+        "hold_sec": time.time() - position.entry_ts,
+        "outcome": outcome,
+    }
+    PAPER_LOG.open("ab").write(orjson.dumps(exit_event) + b"\n")
+    log.info(f"paper.exit.{kind}", **exit_event)
+
+
+async def poll_exits(
+    http: httpx.AsyncClient,
+    open_positions: dict,
+) -> None:
+    """For each open position: fetch CLOB bid, check TP/SL/expiry conditions.
+    Closes positions that hit any exit criteria and logs the exit."""
+    if not open_positions:
+        return
+
+    async def check_one(key: str, pos: "Position") -> None:
+        now = time.time()
+        # First check: has the round ended? If so, we can't TP/SL any more —
+        # fall back to binary resolution.
+        if now >= pos.round_end:
+            outcome = _fetch_round_outcome_sync(pos.slug)
+            if outcome is None:
+                # Market hasn't resolved yet — wait for next poll tick.
+                return
+            won = (pos.side == "YES" and outcome == "UP") or \
+                  (pos.side == "NO" and outcome == "DOWN")
+            # Binary resolution: payout = shares if won, else 0. No exit fee.
+            exit_proceeds = pos.shares if won else 0.0
+            net_pl = exit_proceeds - pos.entry_cost_usdc
+            _log_exit(pos, "resolve", None, exit_proceeds, 0.0, net_pl, outcome)
+            open_positions.pop(key, None)
+            return
+
+        # Fetch current CLOB book to check TP/SL.
+        bids, asks = await fetch_clob_book(http, pos.token_id)
+        if not bids:
+            return  # can't exit if no bids
+        best_bid = bids[0][0]
+
+        exit_kind: ExitKind | None = None
+        if best_bid >= pos.tp_bid:
+            exit_kind = "tp"
+        elif best_bid <= pos.sl_bid:
+            exit_kind = "sl"
+
+        if exit_kind is None:
+            return
+
+        # Sell at best_bid. For paper we assume top-of-book fills cleanly for
+        # our shares (usually true given our $25 size vs typical book depth).
+        fee_rate_at_bid = 0.072 * max(0.0, 1.0 - 4.0 * (best_bid - 0.5) ** 2)
+        gross = pos.shares * best_bid
+        exit_fee_usdc = gross * fee_rate_at_bid
+        exit_proceeds = gross - exit_fee_usdc
+        net_pl = exit_proceeds - pos.entry_cost_usdc
+        _log_exit(pos, exit_kind, best_bid, exit_proceeds, fee_rate_at_bid,
+                  net_pl)
+        open_positions.pop(key, None)
+
+    await asyncio.gather(
+        *(check_one(k, p) for k, p in list(open_positions.items())),
+        return_exceptions=True,
+    )
 
 
 async def run_loop(feed, markets_provider, binance=None) -> None:
     last_status = 0.0
     last_sig: dict = {}
     round_fired: set[int] = set()
+    # Active positions we're managing: key f"{slug}:{side}" → Position
+    open_positions: dict[str, "Position"] = {}
+    last_exit_poll = 0.0
     async with httpx.AsyncClient() as http:
         while True:
             try:
@@ -271,6 +461,12 @@ async def run_loop(feed, markets_provider, binance=None) -> None:
                         last_sig.pop(k, None)
                 # Drop expired rounds so the set doesn't grow forever.
                 round_fired.intersection_update(live_rounds)
+
+                # Exit management: poll open positions for TP/SL/resolve.
+                # Runs at its own cadence (default 1s), not every tick.
+                if now - last_exit_poll >= settings.exit_poll_interval_sec:
+                    await poll_exits(http, open_positions)
+                    last_exit_poll = now
 
                 # Evaluate all markets concurrently — lets live refetches run
                 # in parallel so we don't serialize 9+ HTTP calls.
@@ -287,7 +483,8 @@ async def run_loop(feed, markets_provider, binance=None) -> None:
                         v = feed.velocity_bps_per_sec(
                             m.asset, settings.trajectory_lookback_sec)
                     tasks.append(evaluate_and_log(
-                        m, cur, opn, http, last_sig, round_fired, bn, v))
+                        m, cur, opn, http, last_sig, round_fired,
+                        open_positions, bn, v))
                 if tasks:
                     await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -299,6 +496,7 @@ async def run_loop(feed, markets_provider, binance=None) -> None:
                     )
                     log.info("loop.heartbeat", markets=len(markets),
                              in_window=in_window,
+                             open_positions=len(open_positions),
                              prices={a: feed.last_price.get(a)
                                      for a in ("BTC", "ETH", "SOL")})
                     last_status = now

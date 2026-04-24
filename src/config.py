@@ -88,6 +88,16 @@ class Settings(BaseSettings):
     # 0 disables (revert to per-asset behavior).
     max_picks_per_round: int = 1
 
+    # === ACTIVE EXIT MANAGEMENT ===
+    # Take-profit: exit when CLOB bid rises to entry_ask * (1 + TP_PCT).
+    # E.g. 0.10 = exit when bid = entry × 1.10.
+    take_profit_pct: float = 0.10
+    # Stop-loss: exit when CLOB bid falls to entry_ask * (1 + SL_PCT).
+    # E.g. -0.05 = cut losses when bid drops 5% from entry.
+    stop_loss_pct: float = -0.05
+    # How often (seconds) to poll the CLOB book for held positions.
+    exit_poll_interval_sec: float = 1.0
+
     # Mode
     mode: str = Field(default="paper", pattern="^(paper|live)$")
 
