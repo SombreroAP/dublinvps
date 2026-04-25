@@ -273,8 +273,12 @@ async def evaluate_and_log(
     # growth at half the variance.
     kelly_full = edge / (1 - fill_ask) if fill_ask < 1 else 0.0
     kelly_size = settings.bankroll_usdc * kelly_full * settings.kelly_fraction
+    # For TP/SL strategy, risk per trade is bounded by SL (~14% of stake) NOT
+    # by binary outcome. Kelly's binary-resolution sizing under-stakes when
+    # edge < 0. Use fixed MAX_POSITION_USDC instead — we're not optimizing
+    # log-wealth, we're collecting paper data on momentum continuation.
     size_usdc = max(market.min_size,
-                    min(fillable, settings.max_position_usdc, kelly_size))
+                    min(fillable, settings.max_position_usdc))
 
     # Don't open a new position if we already hold one for this (slug, side).
     position_key = f"{market.slug}:{side}"
