@@ -52,6 +52,9 @@ class Position:
     shares: float              # size_usdc / entry_ask
     tp_bid: float              # bid threshold to sell at take profit
     sl_bid: float              # bid threshold to sell at stop loss
+    # Defensive: flag flipped True on exit. Prevents duplicate exit logs if
+    # the dict.pop() somehow fails (we've seen the bug, root cause unclear).
+    exited: bool = False
 
     @property
     def entry_cost_usdc(self) -> float:
@@ -399,6 +402,11 @@ async def poll_exits(
         return
 
     async def check_one(key: str, pos: "Position") -> None:
+        # Defensive: if this position was already exited, do nothing.
+        # Belt-and-braces with open_positions.pop().
+        if pos.exited:
+            open_positions.pop(key, None)
+            return
         now = time.time()
 
         # Always fetch the CLOB book; we'll decide exit reason from it.
@@ -415,6 +423,7 @@ async def poll_exits(
                 exit_fee_usdc = gross * fee_rate_at_bid
                 exit_proceeds = gross - exit_fee_usdc
                 net_pl = exit_proceeds - pos.entry_cost_usdc
+                pos.exited = True
                 _log_exit(pos, "expired", best_bid, exit_proceeds, fee_rate_at_bid, net_pl)
                 open_positions.pop(key, None)
                 return
@@ -427,6 +436,7 @@ async def poll_exits(
                     # than infinite-loop on a dead position (seen with
                     # 404 on CLOB for resolved markets).
                     if now > pos.round_end + 60:
+                        pos.exited = True
                         _log_exit(pos, "expired", None, 0.0, 0.0,
                                   -pos.entry_cost_usdc)
                         open_positions.pop(key, None)
@@ -435,6 +445,7 @@ async def poll_exits(
                       (pos.side == "NO" and outcome == "DOWN")
                 exit_proceeds = pos.shares if won else 0.0
                 net_pl = exit_proceeds - pos.entry_cost_usdc
+                pos.exited = True
                 _log_exit(pos, "resolve", None, exit_proceeds, 0.0, net_pl, outcome)
                 open_positions.pop(key, None)
             return
@@ -459,6 +470,7 @@ async def poll_exits(
         exit_fee_usdc = gross * fee_rate_at_bid
         exit_proceeds = gross - exit_fee_usdc
         net_pl = exit_proceeds - pos.entry_cost_usdc
+        pos.exited = True
         _log_exit(pos, exit_kind, best_bid, exit_proceeds, fee_rate_at_bid,
                   net_pl)
         open_positions.pop(key, None)
